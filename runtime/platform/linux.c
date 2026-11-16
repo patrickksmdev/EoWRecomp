@@ -210,6 +210,30 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     rt_fault_report(what, fa, pc, lr);
 }
 
+uint64_t renderer_present_count(void);
+void kernel_dump_threads(void);
+void kernel_unstick(void);
+
+static void *watchdog_thread(void *arg) {
+    (void)arg;
+    uint64_t last = 0;
+    int still = 0;
+    bool seen_frame = false;
+    int no_unstick = getenv("EOWRECOMP_NO_UNSTICK") != NULL;
+    for (;;) {
+        sleep(1);
+        uint64_t cur = renderer_present_count();
+        if (cur != last) { last = cur; still = 0; seen_frame = true; continue; }
+        if (!seen_frame) continue;
+        still++;
+        if (!no_unstick && still >= 3 && still % 3 == 0) {
+            if (still == 3) kernel_dump_threads();
+            kernel_unstick();
+        }
+    }
+    return NULL;
+}
+
 void plat_crash_handler_install(void) {
     stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
     sigaltstack(&ss, NULL);
@@ -221,6 +245,11 @@ void plat_crash_handler_install(void) {
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
+    if (!getenv("EOWRECOMP_NO_WATCHDOG")) {
+        pthread_t wt;
+        pthread_create(&wt, NULL, watchdog_thread, NULL);
+        pthread_detach(wt);
+    }
 }
 
 // ---- child processes
