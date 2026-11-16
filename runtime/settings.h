@@ -30,6 +30,7 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
+    bool sync_shaders;   // compile shaders/pipelines synchronously on first use (no missing draws / black flashes)
     bool dpad_move;      // the d-pad (and arrow keys) also act as the left stick
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
     int prompts;         // PROMPTS_*: button glyphs (auto = follow the controller SDL reports): runtime/nvn/texpatch.c

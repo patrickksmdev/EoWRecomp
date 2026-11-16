@@ -487,6 +487,9 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+    opt_toggle("Sync shader compilation", &g_settings.sync_shaders, true,
+               "Compiles new shaders and pipelines before drawing with them. Prevents missing objects and black "
+               "flashes in new areas, at the cost of brief hitches the first time a shader is seen.");
 
     opt_end();
 }

@@ -693,9 +693,9 @@ void vk_jobs_status(char *buf, size_t size) {
 }
 
 static bool sync_shaders(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("EOWRECOMP_SYNC_SHADERS") != NULL;
-    return v;
+    static int env = -1;
+    if (env < 0) env = getenv("EOWRECOMP_SYNC_SHADERS") ? 1 : getenv("EOWRECOMP_ASYNC_SHADERS") ? 0 : 2;
+    return env != 2 ? env != 0 : g_settings.sync_shaders;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
