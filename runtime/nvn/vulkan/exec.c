@@ -2076,6 +2076,24 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
+// Ranges written by storing shaders (cs/vs/fs) or ClearBuffer: cbuf_info reads them live on the GPU instead of
+// taking a stale CPU snapshot before the submission finishes.
+static Range gw_tab[128];
+static int gw_n;
+static void gw_mark(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    for (int i = 0; i < gw_n; i++) {
+        if (gw_tab[i].addr <= addr && gw_tab[i].addr + gw_tab[i].size >= addr + size) return;
+        if (addr <= gw_tab[i].addr && addr + size >= gw_tab[i].addr + gw_tab[i].size) { gw_tab[i] = (Range){addr, size}; return; }
+    }
+    if (gw_n < 128) gw_tab[gw_n++] = (Range){addr, size};
+}
+static bool gw_overlaps(uint64_t addr, uint64_t size) {
+    for (int i = 0; i < gw_n; i++)
+        if (addr < gw_tab[i].addr + gw_tab[i].size && gw_tab[i].addr < addr + size) return true;
+    return false;
+}
+
 static bool guest_live(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
@@ -2126,7 +2144,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // vertex data (guest_direct); the barrier before each pass makes the compute writes visible. EOWRECOMP_VK_LIVE_UBO=0: copy.
     static int live = -1;
     if (live < 0) { const char *e = getenv("EOWRECOMP_VK_LIVE_UBO"); live = !e || atoi(e) != 0; }
-    if (live && (si->cbuf_dynamic & (1u << k)) && stage != 5) {
+    if (live && (((si->cbuf_dynamic & (1u << k)) && stage != 5) || gw_overlaps(r.addr, size))) {
         VkBuffer lb;
         VkDeviceSize lo;
         uint64_t al = g_vk.props.limits.minUniformBufferOffsetAlignment;
@@ -2165,7 +2183,7 @@ static bool gmem_import(uint64_t size) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};  // (uniform: live bone palettes, cbuf_info)
+                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
@@ -2388,6 +2406,7 @@ static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
 static void vc_mark_sbufs(int stage) {
     for (int i = 0; i < 16; i++) {
         uint64_t a = st.sbuf[stage][i].addr, sz = st.sbuf[stage][i].size;
+        if (a && sz) gw_mark(a, sz);
         if (a >= HEAP_BASE && sz && a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + sz);
     }
 }
@@ -2535,6 +2554,7 @@ void vk_exec_reset(void) {
     memset(prog_tab, 0, sizeof prog_tab);
     memset(pipe_tab, 0, sizeof pipe_tab);
     g_cs_n = 0;
+    gw_n = 0;
     gcopy_gen++;
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
@@ -2885,16 +2905,39 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
     }
 }
 
-static void draw_(CmdRec *r, bool indexed);
+static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_off);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
-    draw_(r, indexed);
+    draw_(r, indexed, VK_NULL_HANDLE, 0);
     PROF_ADD(prof_draw);
 }
+static bool draw_indirect(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_off) {
+    PROF_T0();
+    bool ok = draw_(r, indexed, ind_buf, ind_off);
+    PROF_ADD(prof_draw);
+    return ok;
+}
 static uint64_t prof_tp_;
-static void draw_(CmdRec *r, bool indexed) {
+static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_off) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
-    if (!st.program) { SKIP(SKIP_NO_PROGRAM); return; }
+    uint32_t mode = (uint32_t)r->x[0];
+    VkPrimitiveTopology topo;
+    uint8_t cls;
+    bool native = topology(mode, &topo, &cls);
+    VkSpan ib = {0};
+    VkIndexType itype_vk = VK_INDEX_TYPE_UINT32;
+    if (ind_buf != VK_NULL_HANDLE) {
+        if (!native) return false;
+        if (indexed) {
+            uint32_t itype = (uint32_t)r->x[1];
+            if (itype == 0) return false;
+            uint32_t isz = itype == 1 ? 2 : 4;
+            itype_vk = itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+            uint64_t iaddr = r->x[2];
+            if (!iaddr || iaddr % isz != 0 || !guest_live(iaddr, isz, &ib.buf, &ib.off)) return false;
+        }
+    }
+    if (!st.program) { SKIP(SKIP_NO_PROGRAM); return true; }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
@@ -2904,7 +2947,18 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.stencil_tex = stencil_slots(0);
     fkey.stencil_tex = stencil_slots(1);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
+    if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return true; }
+    if (ind_buf != VK_NULL_HANDLE) {
+        for (int i = 0; i < 32; i++) {
+            if (!(pr->vi->attr_mask & (1u << i))) continue;
+            uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
+            uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F;
+            if (i >= st.nattrib || fmt == 0 || stream >= 16) continue;
+            Range v = st.vbuf[stream];
+            VkBuffer dbuf; VkDeviceSize doff;
+            if (v.addr && (!v.size || !guest_direct(v.addr, v.size, &dbuf, &doff))) return false;
+        }
+    }
     {   // fragment-shader hash: skip lists (EOWRECOMP_SKIP_FSHASH), debug logging
         static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
@@ -2921,7 +2975,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 while (*p == ',') p++;
             }
         }
-        for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { SKIP(SKIP_LIST); return; }
+        for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { SKIP(SKIP_LIST); return true; }
         // Same for the vertex shader (EOWRECOMP_SKIP_VSHASH): the main characters share one fragment shader, so only the vertex
         // shader tells the skinned meshes apart when hunting the stretched part (2026-11-10).
         static uint64_t last_vs, last_vhash, vskip[16];
@@ -2938,7 +2992,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 while (*p == ',') p++;
             }
         }
-        for (int i = 0; i < nvskip; i++) if (last_vhash == vskip[i]) { SKIP(SKIP_LIST); return; }
+        for (int i = 0; i < nvskip; i++) if (last_vhash == vskip[i]) { SKIP(SKIP_LIST); return true; }
         // EOWRECOMP_SKIP_VSPROG=a1,a2,...: skip by vertex-shader address (the [draw] lines' "vs=..."). The hash above covers only the
         // first 0x200 bytes, so every variant of the depth pre-pass shares one hash and the hunt for the pre-pass draw that writes
         // the wrong depth around the rift portal (2026-11-13) cannot tell them apart.
@@ -2951,7 +3005,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 while (*p == ',') p++;
             }
         }
-        for (int i = 0; i < npskip; i++) if (vs == pskip[i]) { SKIP(SKIP_LIST); return; }
+        for (int i = 0; i < npskip; i++) if (vs == pskip[i]) { SKIP(SKIP_LIST); return true; }
         g_cur_vs_hash = last_vhash;
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
@@ -2991,10 +3045,10 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         if (frozen && shi > slo) {
-            for (int q = slo; q < shi; q++) if (keys[q] == key) { SKIP(SKIP_LIST); return; }
+            for (int q = slo; q < shi; q++) if (keys[q] == key) { SKIP(SKIP_LIST); return true; }
         }
     }
-    if (g_debug_frame) debug_draw(pr, r, indexed);
+    if (g_debug_frame && !ind_buf) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
     alias_draw_check();
     resolve_feedback(pr);
@@ -3018,14 +3072,15 @@ static void draw_(CmdRec *r, bool indexed) {
             if (vk_texture_unscale(st.rt.color[i])) st.rt_dirty = true;
         }
     }
+    if (ind_buf != VK_NULL_HANDLE && ind_dirty) {
+        vk_end_pass();
+        vk_full_barrier(vk_cmd());
+        ind_dirty = false;
+    }
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
 
-    uint32_t mode = (uint32_t)r->x[0];
-    VkPrimitiveTopology topo;
-    uint8_t cls;
-    bool native = topology(mode, &topo, &cls);
-    if (!native && mode != 6 && mode != 7 && mode != 9) { SKIP(SKIP_TOPOLOGY); return; }
+    if (!native && mode != 6 && mode != 7 && mode != 9) { SKIP(SKIP_TOPOLOGY); return true; }
 
     uint64_t prof_tk_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_pre += prof_tk_ - prof_tp_;
@@ -3085,7 +3140,7 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
     }
-    if (atomic_load(&pp->state) != 1) { SKIP(atomic_load(&pp->state) == 0 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED); return; }
+    if (atomic_load(&pp->state) != 1) { SKIP(atomic_load(&pp->state) == 0 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED); return true; }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
@@ -3180,7 +3235,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if ((tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == st.rt.color[0]->width &&
                 tex_wh[1][i][1] == st.rt.color[0]->height)
                 reads_scene = true;
-        bool fullscreen_quad = r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
+        bool fullscreen_quad = !ind_buf && r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
                                st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
         bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad;
         if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
@@ -3227,15 +3282,15 @@ static void draw_(CmdRec *r, bool indexed) {
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
-    uint32_t first = 0, count = (uint32_t)r->x[2], inst, base_inst, max_index = 0;
+    uint32_t first = 0, count = ind_buf != VK_NULL_HANDLE ? 0 : (uint32_t)r->x[2], inst = 1, base_inst = 0, max_index = 0;
     int32_t base_vertex = 0;
-    VkSpan ib = {0};
-    VkIndexType itype_vk = VK_INDEX_TYPE_UINT32;
     uint32_t icount = 0;
     bool use_index = indexed || !native;
     const void *scan_src = NULL;  // deferred index scan (direct index buffer)
     uint32_t scan_isz = 0, scan_restart = 0;
-    if (!indexed) {
+    if (ind_buf != VK_NULL_HANDLE) {
+        // index and vertex buffers already validated as guest_live / guest_direct above
+    } else if (!indexed) {
         first = (uint32_t)r->x[1]; base_inst = (uint32_t)r->x[3]; inst = (uint32_t)r->x[4] ? (uint32_t)r->x[4] : 1;
         max_index = first + count;
         if (!native) {
@@ -3334,14 +3389,19 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
     float pvp[4] = {vp[0] * vp_sx + vp_ox, vp[1] * vp_sy + vp_oy, vp[2] * vp_sx, vp[3] * vp_sy};
     bool probing = probe_begin(cb, st.program->stages[0].code_addr, st.program->stages[1].code_addr, (uint32_t)(use_index ? icount : count), inst, use_index, pvp);
-    for (int ri = 0; ri < nruns; ri++) {
-        if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
-            float rtint[8] = {0};
-            VkDescriptorSet rset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, rtint, 0, 0, 0, fii);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 1, 1, &rset, 0, NULL);
+    if (ind_buf != VK_NULL_HANDLE) {
+        if (!indexed) vkCmdDrawIndirect(cb, ind_buf, ind_off, 1, 0);
+        else vkCmdDrawIndexedIndirect(cb, ind_buf, ind_off, 1, 0);
+    } else {
+        for (int ri = 0; ri < nruns; ri++) {
+            if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
+                float rtint[8] = {0};
+                VkDescriptorSet rset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, rtint, 0, 0, 0, fii);
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 1, 1, &rset, 0, NULL);
+            }
+            if (!use_index) vkCmdDraw(cb, count, run_n[ri], first, base_inst + run_at[ri]);
+            else vkCmdDrawIndexed(cb, icount, run_n[ri], 0, base_vertex, base_inst + run_at[ri]);
         }
-        if (!use_index) vkCmdDraw(cb, count, run_n[ri], first, base_inst + run_at[ri]);
-        else vkCmdDrawIndexed(cb, icount, run_n[ri], 0, base_vertex, base_inst + run_at[ri]);
     }
     if (probing) probe_end(cb);
     stat_draws++;
@@ -3353,6 +3413,7 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         gp_draws[gp_n - 1]++;
     }
+    return true;
 }
 
 static float dbg_half(uint16_t h) {  // IEEE half -> float (skin-cpu: F16x4 positions)
@@ -4241,6 +4302,8 @@ static void exec_list(uint64_t handle, int depth) {
                 vk_full_barrier(cb);
                 vkCmdFillBuffer(cb, gb, go, n, v);
                 vk_full_barrier(cb);
+                ind_dirty = true;
+                gw_mark(a, n);
                 if (a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + n);
             } else {
                 wait_why = "ClearBuffer (unaligned / not in the heap)";
@@ -4251,10 +4314,20 @@ static void exec_list(uint64_t handle, int depth) {
         }
         case CMD_DRAW_ARRAYS_INDIRECT: case CMD_DRAW_ELEMENTS_INDIRECT: case CMD_DISPATCH_INDIRECT: {
             // The GPU decides what is drawn: the arguments sit in a buffer a compute shader fills (the game's vegetation:
-            // trees and grass are GPU-culled instance lists). The arguments are read on the CPU once the GPU work that
-            // wrote them is done (a flush only if a dispatch ran since the last one), then this is an ordinary draw.
+            // trees and grass are GPU-culled instance lists). Execute directly on the GPU via vkCmdDraw*Indirect when
+            // the argument, index and vertex buffers live in the imported guest heap (no CPU flush/stall).
             uint64_t ia = r->op == CMD_DRAW_ELEMENTS_INDIRECT ? r->x[3] : r->op == CMD_DRAW_ARRAYS_INDIRECT ? r->x[1] : r->x[0];
             if (!ia) break;
+            static int gpu_ind = -1;
+            if (gpu_ind < 0) { const char *e = getenv("EOWRECOMP_GPU_INDIRECT"); gpu_ind = !e || atoi(e) != 0; }
+            VkBuffer ind_buf = VK_NULL_HANDLE;
+            VkDeviceSize ind_off = 0;
+            uint64_t isz_arg = r->op == CMD_DRAW_ELEMENTS_INDIRECT ? 20 : 16;
+            if (gpu_ind && r->op != CMD_DISPATCH_INDIRECT && guest_live(ia, isz_arg, &ind_buf, &ind_off) &&
+                draw_indirect(r, r->op == CMD_DRAW_ELEMENTS_INDIRECT, ind_buf, ind_off)) {
+                ind_n++;
+                break;
+            }
             if (ind_dirty) { wait_why = "indirect draw arguments"; renderer_flush(); ind_dirty = false; ind_flush_pending = true; }
             const uint32_t *a = (const uint32_t *)(uintptr_t)ia;
             ind_n++;
