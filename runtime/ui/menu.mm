@@ -444,11 +444,11 @@ static void tab_display(void) {
     opt_toggle("VSync", &g_settings.vsync, true,
                "Synchronizes presentation with your monitor's refresh rate (FIFO) to prevent tearing and runaway frames.");
     {
-        static const char *fps_lbls[] = {"30", "60", "120", "Unlimited"};
-        static const int fps_vals[] = {30, 60, 120, 0};
+        static const char *fps_lbls[] = {"30", "60", "120", "144", "Unlimited"};
+        static const int fps_vals[] = {30, 60, 120, 144, 0};
         int fi = 1;
-        for (int i = 0; i < 4; i++) if (fps_vals[i] == g_settings.fps_limit) fi = i;
-        if (opt_choice("FPS limit", &fi, fps_lbls, 4, 1,
+        for (int i = 0; i < 5; i++) if (fps_vals[i] == g_settings.fps_limit) fi = i;
+        if (opt_choice("FPS limit", &fi, fps_lbls, 5, 1,
                        "Caps the maximum frame rate on the host. 60 matches the Switch's target; Unlimited lets VSync or your GPU decide."))
             g_settings.fps_limit = fps_vals[fi];
     }
