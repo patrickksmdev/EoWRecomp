@@ -24,7 +24,7 @@ Settings g_settings = {
     .show_fps = false,
     .vsync = true,
     .fps_limit = 60,
-    .sync_shaders = true,
+    .sync_shaders = SHADER_SMART,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 };
 
@@ -97,7 +97,9 @@ void settings_load(void) {
             int n = atoi(val);
             g_settings.fps_limit = (n == 30 || n == 60 || n == 120 || n == 144) ? n : 0;
         }
-        else if (!strcmp(key, "sync_shaders")) g_settings.sync_shaders = atoi(val) != 0;
+        else if (!strcmp(key, "sync_shaders"))
+            g_settings.sync_shaders = !strcmp(val, "smart") ? SHADER_SMART : !strcmp(val, "async") ? SHADER_ASYNC
+                                    : (!strcmp(val, "sync") || atoi(val) != 0) ? SHADER_SYNC : SHADER_ASYNC;
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
@@ -138,7 +140,7 @@ void settings_save(void) {
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "vsync = %d\n", g_settings.vsync);
     fprintf(f, "fps_limit = %d\n", g_settings.fps_limit);
-    fprintf(f, "sync_shaders = %d\n", g_settings.sync_shaders);
+    fprintf(f, "sync_shaders = %s\n", g_settings.sync_shaders == SHADER_SYNC ? "sync" : g_settings.sync_shaders == SHADER_ASYNC ? "async" : "smart");
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
     if (g_settings.res_mode == RES_DYNAMIC) fprintf(f, "resolution = dynamic\n");

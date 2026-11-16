@@ -12,6 +12,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
+enum { SHADER_SMART = 0, SHADER_SYNC = 1, SHADER_ASYNC = 2 };
 enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3 };
 // System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
 // the game picks its text language from it, as it would from the Switch's own system setting. LANG_AUTO follows the
@@ -32,7 +33,7 @@ typedef struct {
     bool show_fps;
     bool vsync;          // Vulkan swapchain VSync (FIFO vs Mailbox/Immediate)
     int fps_limit;       // host frame rate cap: 0 = unlimited, or 30 / 60 / 120
-    bool sync_shaders;   // compile shaders/pipelines synchronously on first use (no missing draws / black flashes)
+    int sync_shaders;    // SHADER_*: Smart (prewarm + sync critical), Sync (always block), Async (never block)
     bool dpad_move;      // the d-pad (and arrow keys) also act as the left stick
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
     int prompts;         // PROMPTS_*: button glyphs (auto = follow the controller SDL reports): runtime/nvn/texpatch.c

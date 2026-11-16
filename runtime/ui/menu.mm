@@ -498,9 +498,12 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
-    opt_toggle("Sync shader compilation", &g_settings.sync_shaders, true,
-               "Compiles new shaders and pipelines before drawing with them. Prevents missing objects and black "
-               "flashes in new areas, at the cost of brief hitches the first time a shader is seen.");
+    {
+        static const char *sh_modes[] = {"Smart", "Sync", "Async"};
+        opt_choice("Shader compilation", &g_settings.sync_shaders, sh_modes, 3, SHADER_SMART,
+                   "Smart: pre-warms shaders during loading and only waits on fullscreen/compute passes (no black "
+                   "flashes, minimal hitches). Sync: always waits (no pop-in). Async: never waits.");
+    }
 
     opt_end();
 }

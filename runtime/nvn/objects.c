@@ -630,6 +630,10 @@ static void set_shaders(Cpu *c, int stride) {
         p->stages[stage].const_size = *(const uint32_t *)(control + 0x6FC);
         p->stage_mask |= 1u << stage;
     }
+#ifndef EOW_METAL
+    extern void vk_prewarm_program(NvnProgram *p);
+    vk_prewarm_program(p);
+#endif
     RET(1);
 }
 

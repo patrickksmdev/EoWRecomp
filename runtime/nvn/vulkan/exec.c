@@ -692,10 +692,14 @@ void vk_jobs_status(char *buf, size_t size) {
                  (unsigned long long)atomic_load(&g_wk_vsize[lw]));
 }
 
-static bool sync_shaders(void) {
+static bool g_prewarm_async;
+static int shader_mode(void) {
     static int env = -1;
-    if (env < 0) env = getenv("EOWRECOMP_SYNC_SHADERS") ? 1 : getenv("EOWRECOMP_ASYNC_SHADERS") ? 0 : 2;
-    return env != 2 ? env != 0 : g_settings.sync_shaders;
+    if (env < 0) env = getenv("EOWRECOMP_SYNC_SHADERS") ? SHADER_SYNC : getenv("EOWRECOMP_ASYNC_SHADERS") ? SHADER_ASYNC : -1;
+    return env >= 0 ? env : g_settings.sync_shaders;
+}
+static bool sync_shaders(void) {
+    return !g_prewarm_async && shader_mode() == SHADER_SYNC;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -2804,6 +2808,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
+    if (cp && atomic_load(&cp->p.state) == 0 && shader_mode() != SHADER_ASYNC) {
+        while (atomic_load(&cp->p.state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
+    }
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP(SKIP_COMPUTE_PROG); return; }
     {   // EOWRECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
         static uint64_t skip = ~0ull;
@@ -2947,6 +2954,10 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
     vkey.stencil_tex = stencil_slots(0);
     fkey.stencil_tex = stencil_slots(1);
     Prog *pr = get_program(st.program, &vkey, &fkey);
+    bool critical = !indexed && !ind_buf && r->x[2] <= 6;
+    if (pr && atomic_load(&pr->state) == 0 && shader_mode() == SHADER_SMART && critical) {
+        while (atomic_load(&pr->state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
+    }
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return true; }
     if (ind_buf != VK_NULL_HANDLE) {
         for (int i = 0; i < 32; i++) {
@@ -3139,6 +3150,9 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
         pipe_tab[pslot].key = ph;
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
+    }
+    if (atomic_load(&pp->state) == 0 && shader_mode() == SHADER_SMART && critical) {
+        while (atomic_load(&pp->state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
     }
     if (atomic_load(&pp->state) != 1) { SKIP(atomic_load(&pp->state) == 0 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED); return true; }
     ss_enabled();
@@ -4129,7 +4143,40 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 }
 
 // ================================================================== executor (renderer.m exec_list)
+// Pre-warm shaders in the background as soon as the game calls nvnProgramSetShaders (during loading screens).
+static NvnProgram *pw_ring[256];
+static uint32_t pw_head, pw_tail;
+static pthread_mutex_t pw_lock = PTHREAD_MUTEX_INITIALIZER;
+void vk_prewarm_program(NvnProgram *np) {
+    if (!np || !np->stage_mask) return;
+    pthread_mutex_lock(&pw_lock);
+    if (pw_head - pw_tail < 256) pw_ring[pw_head++ & 255] = np;
+    pthread_mutex_unlock(&pw_lock);
+}
+static void vk_prewarm_drain(void) {
+    if (__atomic_load_n(&pw_head, __ATOMIC_RELAXED) == __atomic_load_n(&pw_tail, __ATOMIC_RELAXED)) return;
+    g_prewarm_async = true;
+    for (;;) {
+        NvnProgram *np = NULL;
+        pthread_mutex_lock(&pw_lock);
+        if (pw_tail != pw_head) np = pw_ring[pw_tail++ & 255];
+        pthread_mutex_unlock(&pw_lock);
+        if (!np) break;
+        if (np->stage_mask & 32) {
+            compute_program(np);
+        } else if ((np->stage_mask & 1) && (np->stage_mask & 2)) {
+            ShaderKey vk = {0}, fk = {0};
+            vk.glsl = fk.glsl = 1;
+            vk.flip_y = fk.flip_y = 1;
+            vk.depth_minus_one = 1;
+            get_program(np, &vk, &fk);
+        }
+    }
+    g_prewarm_async = false;
+}
+
 static void exec_list(uint64_t handle, int depth) {
+    if (depth == 0) vk_prewarm_drain();
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
