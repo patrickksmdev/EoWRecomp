@@ -30,6 +30,8 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
+    bool vsync;          // Vulkan swapchain VSync (FIFO vs Mailbox/Immediate)
+    int fps_limit;       // host frame rate cap: 0 = unlimited, or 30 / 60 / 120
     bool sync_shaders;   // compile shaders/pipelines synchronously on first use (no missing draws / black flashes)
     bool dpad_move;      // the d-pad (and arrow keys) also act as the left stick
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language

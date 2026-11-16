@@ -285,20 +285,23 @@ void vk_pipeline_cache_save(void) {
 
 // ================================================================== swapchain
 static bool g_sc_turned;  // the compositor turns our images (IDENTITY on a rotated display): presents say "suboptimal"
+static bool g_sc_vsync;
 static VkPresentModeKHR present_mode(void) {
-    // MAILBOX by default: the game paces itself (vi.c's emulated 60 Hz vsync), and with FIFO every submission
-    // queued behind the one waiting for a window image, so the game's fence waits followed the presentation engine:
-    // a throttled / captured / busy compositor slowed the whole game (4-21 fps with the GPU mostly idle; mailbox:
-    // 60). No tearing. EOWRECOMP_VK_PRESENT=fifo|immediate|mailbox to choose.
+    // Follow g_settings.vsync (FIFO on, MAILBOX/IMMEDIATE off); EOWRECOMP_VK_PRESENT=fifo|immediate|mailbox overrides.
     const char *e = getenv("EOWRECOMP_VK_PRESENT");
-    VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
-                          : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    g_sc_vsync = g_settings.vsync;
+    VkPresentModeKHR want = e ? (!strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+                                : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR)
+                              : (g_sc_vsync ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR);
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    if (!g_sc_vsync) {
+        for (uint32_t i = 0; i < n; i++) if (m[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    }
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -461,7 +464,8 @@ bool vk_frame_begin(const float clear[4]) {
     if (atomic_load(&g_background)) return false;
     if (atomic_exchange(&g_surface_stale, false)) new_surface();
     if (!g_vk.surface) return false;
-    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
+    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
+        (!getenv("EOWRECOMP_VK_PRESENT") && g_sc_vsync != g_settings.vsync)) recreate_swapchain();
     if (!g_vk.swapchain) return false;
     static int trace = -1;
     if (trace < 0) trace = getenv("EOWRECOMP_VK_TRACE") != NULL;
@@ -671,6 +675,16 @@ void backend_present(NvnTexture *t) {
     g_frame_counter++;
     extern void vk_pace_frame(void);
     vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
+    if (g_settings.fps_limit > 0) {
+        static uint64_t next_frame_ns;
+        uint64_t period = 1000000000ull / (uint64_t)g_settings.fps_limit;
+        uint64_t now_ns = plat_now_ns();
+        if (!next_frame_ns || now_ns > next_frame_ns + period * 2) next_frame_ns = now_ns;
+        else {
+            next_frame_ns += period;
+            if (next_frame_ns > now_ns) plat_sleep_until_ns(next_frame_ns);
+        }
+    }
     extern void input_frame(uint64_t frame);
     input_frame(total_frames);
     static long slow_ms = -1;

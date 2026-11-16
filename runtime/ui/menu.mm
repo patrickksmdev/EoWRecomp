@@ -441,6 +441,17 @@ static void tab_display(void) {
         g_want_fullscreen_apply.store(true);
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
+    opt_toggle("VSync", &g_settings.vsync, true,
+               "Synchronizes presentation with your monitor's refresh rate (FIFO) to prevent tearing and runaway frames.");
+    {
+        static const char *fps_lbls[] = {"30", "60", "120", "Unlimited"};
+        static const int fps_vals[] = {30, 60, 120, 0};
+        int fi = 1;
+        for (int i = 0; i < 4; i++) if (fps_vals[i] == g_settings.fps_limit) fi = i;
+        if (opt_choice("FPS limit", &fi, fps_lbls, 4, 1,
+                       "Caps the maximum frame rate on the host. 60 matches the Switch's target; Unlimited lets VSync or your GPU decide."))
+            g_settings.fps_limit = fps_vals[fi];
+    }
 
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)
