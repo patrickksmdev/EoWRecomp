@@ -221,13 +221,13 @@ static void *watchdog_thread(void *arg) {
     bool seen_frame = false;
     int no_unstick = getenv("EOWRECOMP_NO_UNSTICK") != NULL;
     for (;;) {
-        sleep(1);
+        usleep(100000);
         uint64_t cur = renderer_present_count();
         if (cur != last) { last = cur; still = 0; seen_frame = true; continue; }
         if (!seen_frame) continue;
         still++;
-        if (!no_unstick && still >= 3 && still % 3 == 0) {
-            if (still == 3) kernel_dump_threads();
+        if (!no_unstick && still >= 5 && still % 5 == 0) {
+            if (still == 30) kernel_dump_threads();
             kernel_unstick();
         }
     }
