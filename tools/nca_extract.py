@@ -73,10 +73,44 @@ def nsp_ncas(path):
     return out
 
 
+def hfs0_entries(f, base):
+    """[(name, offset, size)] of an HFS0 at `base` (offsets absolute in the file)."""
+    f.seek(base)
+    magic, n, strsz, _ = struct.unpack('<4sIII', f.read(0x10))
+    if magic != b'HFS0':
+        raise SystemExit(f'not an HFS0 at 0x{base:x}: {magic!r}')
+    ents = [struct.unpack_from('<QQI', f.read(0x40), 0) for _ in range(n)]
+    names = f.read(strsz)
+    data = base + 0x10 + n * 0x40 + strsz
+    return [(names[no:names.index(b'\0', no)].decode(), data + off, size) for off, size, no in ents]
+
+
+def xci_ncas(path):
+    """[(name, offset, size)] of the .nca entries in an XCI's secure partition."""
+    with open(path, 'rb') as f:
+        f.seek(0x100)
+        head = f.read(0x40)
+        if head[:4] != b'HEAD':
+            raise SystemExit(f'{path}: not an XCI (HEAD)')
+        root = struct.unpack_from('<Q', head, 0x30)[0]
+        parts = {name: (off, size) for name, off, size in hfs0_entries(f, root)}
+        if 'secure' not in parts:
+            raise SystemExit(f'{path}: no secure partition in XCI')
+        sec_off, _ = parts['secure']
+        ents = hfs0_entries(f, sec_off)
+    end = max(off + size for _name, off, size in ents)
+    have = os.path.getsize(path)
+    if have < end:
+        raise SystemExit(f'{path}: truncated, {have} bytes of {end} ({(end - have) / 2**20:.0f} MiB missing)')
+    return [(name, off, size) for name, off, size in ents if name.endswith('.nca') and not name.endswith('.cnmt.nca')]
+
+
 def open_program_nca(path, keys):
-    if not path.lower().endswith('.nsp'):
+    lo = path.lower()
+    if not lo.endswith('.nsp') and not lo.endswith('.xci'):
         return Nca(path, keys)
-    for name, off, _size in sorted(nsp_ncas(path), key=lambda e: -e[2]):
+    ncas = xci_ncas(path) if lo.endswith('.xci') else nsp_ncas(path)
+    for name, off, _size in sorted(ncas, key=lambda e: -e[2]):
         nca = Nca(path, keys, off, need_sections=False)
         if nca.content_type == 0:
             print(f'{path}: program NCA {name}')
