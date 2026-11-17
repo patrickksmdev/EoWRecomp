@@ -36,8 +36,8 @@ if [ "$ARCH" = aarch64 ]; then
         done
         touch "$S/.ok"
     fi
-    run "$ARM" tools/linux/rando_helper.sh aarch64
+    run "$ARM" sh -c "make gen-helper GEN_VENV=build/linux/aarch64/gen-venv && mkdir -p build/linux/aarch64/helper && rm -rf build/linux/aarch64/helper/eowgen && mv build/helper/eowgen build/linux/aarch64/helper/"
 else
-    run "$AMD" tools/linux/rando_helper.sh x86_64
+    run "$AMD" sh -c "make gen-helper GEN_VENV=build/linux/x86_64/gen-venv && mkdir -p build/linux/x86_64/helper && rm -rf build/linux/x86_64/helper/eowgen && mv build/helper/eowgen build/linux/x86_64/helper/"
 fi
 run "$AMD" tools/linux/package.sh "$ARCH"
