@@ -1886,7 +1886,7 @@ static uint64_t stat_alias_made, stat_alias_renamed, stat_alias_partial, stat_al
 
 static int copy_opt(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("EOWRECOMP_VK_COPY_OPT"); on = e && *e ? atoi(e) : 0; }
+    if (on < 0) { const char *e = getenv("EOWRECOMP_VK_COPY_OPT"); on = e && *e ? atoi(e) : 1; }
     return on;
 }
 
