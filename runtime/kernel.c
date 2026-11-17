@@ -257,10 +257,14 @@ static uint32_t *u32p(uint64_t a) { return (uint32_t *)(uintptr_t)a; }
 // Try to take mutex `m` for `tag`, or mark it contended. Returns true if acquired. Uses CAS so a
 // concurrent user-space unlock (owner storing 0) is never overwritten.
 static bool mutex_acquire_or_mark(uint64_t m, uint32_t tag) {
+    bool has_waiters = false;
+    for (KThread *t = g_waitlist; t; t = t->wnext)
+        if (t->wait_kind == WAIT_MUTEX && t->wait_addr == m) { has_waiters = true; break; }
+    uint32_t want = tag | (has_waiters ? WAITERS_BIT : 0);
     for (;;) {
         uint32_t v = __atomic_load_n(u32p(m), __ATOMIC_SEQ_CST);
         if (v == 0) {
-            if (__atomic_compare_exchange_n(u32p(m), &v, tag, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return true;
+            if (__atomic_compare_exchange_n(u32p(m), &v, want, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return true;
         } else {
             if ((v & WAITERS_BIT) ||
                 __atomic_compare_exchange_n(u32p(m), &v, v | WAITERS_BIT, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
