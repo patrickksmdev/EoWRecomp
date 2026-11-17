@@ -91,14 +91,14 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 static const uint8_t BUILD_ID[8] = {0xa5, 0x81, 0x40, 0x6b, 0xc9, 0x85, 0x86, 0x51};  // Echoes of Wisdom v1.0.0 main (docs/STATUS.md)
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): alpha_<n> while the game isn't playable, beta_<n> until 1.0, then v<major>.<minor>.<patch>.
-#define EOWRECOMP_VERSION "beta_1"
+#define EOWRECOMP_VERSION "v0.2.0"
 
 // ------------------------------------------------------------------ update check
 // The start screen asks GitHub for the project's releases once per launch (a background curl, which macOS and
 // Windows 10+ ship) and offers the best one if it outranks this build: any v1.0.0+ above every beta, every beta
 // above every alpha, alphas and betas by number; other tags are ignored. Offline / no curl / anything unexpected: nothing is shown.
 // The release feed checked for updates ("" = no update check).
-#define RELEASES_URL "https://api.github.com/repos/Nycolazs/EoWRecomp/releases"
+#define RELEASES_URL "https://api.github.com/repos/patrickksmdev/EoWRecomp/releases"
 #define RELEASE_PAGE "https://github.com/Nycolazs/EoWRecomp/releases/tag/"
 
 static long long tag_rank(const std::string &t) {
