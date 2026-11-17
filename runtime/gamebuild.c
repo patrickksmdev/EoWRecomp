@@ -382,6 +382,7 @@ static void add_cflags(Args *a, const Tools *t) {
             add(a, f);
         }
     }
+    if (t->zig) add(a, "-g0");  // zig cc emits DWARF debug info by default (~1.2 GB) unless -g0 is passed
 }
 
 static PlatProc start_compile(const Tools *t, const Unit *u) {
