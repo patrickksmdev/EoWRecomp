@@ -2876,6 +2876,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
     if (writes_image) vk_full_barrier(cb);  // (the next pass samples what SUST wrote)
+    // Suthorn Rift: exiting a rift area leaves the 72a46fe000/72a4705000/72a470d000 compute trio's output out of sync
+    // with the subsequent rift mask draw (vs 72a7160000) unless flushed once here.
+    if (st.program->stages[5].code_addr == 0x72a470d000ull) renderer_flush();
     stat_dispatches++;
 }
 
