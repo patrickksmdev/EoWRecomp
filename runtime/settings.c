@@ -95,7 +95,7 @@ void settings_load(void) {
         else if (!strcmp(key, "vsync")) g_settings.vsync = atoi(val) != 0;
         else if (!strcmp(key, "fps_limit")) {
             int n = atoi(val);
-            g_settings.fps_limit = (n == 30 || n == 60 || n == 120 || n == 144) ? n : 0;
+            g_settings.fps_limit = (n == 30 || n == 60 || n == 120) ? n : 0;
         }
         else if (!strcmp(key, "sync_shaders"))
             g_settings.sync_shaders = !strcmp(val, "smart") ? SHADER_SMART : !strcmp(val, "async") ? SHADER_ASYNC
