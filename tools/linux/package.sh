@@ -44,7 +44,7 @@ cp README.md LICENSE "$APPDIR/usr/bin/"  # (licenses and source links of the bun
 [ -d "$L/helper/eowgen" ] || { echo "no game code generator helper ($L/helper/eowgen): run make gen-helper first"; exit 1; }
 cp -R "$L/helper/eowgen" build/zig "$APPDIR/usr/bin/"
 mkdir "$APPDIR/usr/bin/gamelib-src"
-cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
+cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h runtime/modules.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
    "$APPDIR/usr/bin/gamelib-src/"
 cp tools/linux/AppRun "$APPDIR/" && chmod +x "$APPDIR/AppRun"
 cp tools/linux/eowrecomp.desktop "$APPDIR/"
