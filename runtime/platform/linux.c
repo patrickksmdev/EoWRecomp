@@ -226,10 +226,8 @@ static void *watchdog_thread(void *arg) {
         if (cur != last) { last = cur; still = 0; seen_frame = true; continue; }
         if (!seen_frame) continue;
         still++;
-        if (!no_unstick && still >= 5 && still % 5 == 0) {
-            if (still == 30) kernel_dump_threads();
-            kernel_unstick();
-        }
+        if (still == 30) kernel_dump_threads();
+        if (!no_unstick && still >= 5 && still % 5 == 0) kernel_unstick();
     }
     return NULL;
 }
