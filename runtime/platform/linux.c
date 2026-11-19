@@ -235,18 +235,21 @@ static void *watchdog_thread(void *arg) {
 void plat_crash_handler_install(void) {
     stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
     sigaltstack(&ss, NULL);
-    struct sigaction sa = {0};
-    sa.sa_sigaction = crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGILL, &sa, NULL);
-    sigaction(SIGFPE, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    if (!getenv("EOWRECOMP_NO_WATCHDOG")) {
-        pthread_t wt;
-        pthread_create(&wt, NULL, watchdog_thread, NULL);
-        pthread_detach(wt);
+    static bool g_installed = false;
+    if (!__atomic_exchange_n(&g_installed, true, __ATOMIC_ACQ_REL)) {
+        struct sigaction sa = {0};
+        sa.sa_sigaction = crash_handler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        sigaction(SIGILL, &sa, NULL);
+        sigaction(SIGFPE, &sa, NULL);
+        sigaction(SIGABRT, &sa, NULL);
+        if (!getenv("EOWRECOMP_NO_WATCHDOG")) {
+            pthread_t wt;
+            pthread_create(&wt, NULL, watchdog_thread, NULL);
+            pthread_detach(wt);
+        }
     }
 }
 

@@ -287,7 +287,8 @@ static void mutex_release(uint64_t addr) {
         __atomic_store_n(u32p(addr), 0, __ATOMIC_SEQ_CST);
         return;
     }
-    __atomic_store_n(u32p(addr), next->handle | (count > 1 ? WAITERS_BIT : 0), __ATOMIC_SEQ_CST);
+    uint32_t owner_tag = next->wait_tag ? next->wait_tag : next->handle;
+    __atomic_store_n(u32p(addr), owner_tag | (count > 1 ? WAITERS_BIT : 0), __ATOMIC_SEQ_CST);
     next->wait_kind = WAIT_NONE;
     next->wait_result = R_OK;
     wake(next);
@@ -301,9 +302,10 @@ static void waitlist_remove(KThread *t) {
         if (*p == t) { *p = t->wnext; return; }
 }
 
-// Block until wait_kind is cleared by a waker, timeout, or cancel. Caller holds g_klock.
+// Block until wait_kind is cleared by a waker, timeout, or reboot unwind. Caller holds g_klock.
 static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
+    if (timeout_ns >= 1000000000000000000LL) timeout_ns = -1;  // avoid CLOCK_REALTIME + timeout overflow
     struct timespec ts;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
@@ -313,13 +315,15 @@ static uint32_t block_current(int64_t timeout_ns) {
             t->wait_result = R_CANCELLED;
             break;
         }
-        if (t->cancel) {
-            t->cancel = false;
-            t->wait_kind = WAIT_NONE;
-            t->wait_result = R_CANCELLED;
-            break;
-        }
+        if (t->wait_kind == WAIT_MUTEX) timeout_ns = -1;  // once signalled onto mutex, reacquisition never times out
         if (!kwait(timeout_ns, &ts)) {
+            // Re-check wait_kind after reacquiring g_klock: a concurrent signaler or mutex_release may have
+            // already woken us (and granted the mutex) right as pthread_cond_timedwait timed out.
+            if (t->wait_kind == WAIT_NONE) break;
+            if (t->wait_kind == WAIT_MUTEX) {
+                timeout_ns = -1;
+                continue;
+            }
             t->wait_kind = WAIT_NONE;
             t->wait_result = R_TIMEOUT;
             break;
@@ -371,15 +375,30 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
 
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     pthread_mutex_lock(&g_klock);
+    if (timeout == 0) {
+        mutex_release(mutex);
+        kev_add('W', key, 0, 0);
+        kev_add('w', key, (int32_t)R_TIMEOUT, 0);
+        pthread_mutex_unlock(&g_klock);
+        return R_TIMEOUT;
+    }
     KThread *t = t_cur;
-    mutex_release(mutex);
     t->wait_kind = WAIT_CONDVAR;
     t->wait_addr = key;
     t->wait_mutex = mutex;
     t->wait_tag = tag;
+    // Publish key=1 BEFORE releasing mutex so a concurrent producer taking mutex in user space
+    // cannot enqueue, unlock, read *key == 0, and skip svcSignalProcessWideKey.
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
+    mutex_release(mutex);
     kev_add('W', key, (int32_t)(timeout < 0 ? -1 : timeout / 1000000), 0);
     uint32_t r = block_current(timeout);
+    if (r != R_OK) {
+        bool any_left = false;
+        for (KThread *w = g_waitlist; w; w = w->wnext)
+            if (w->wait_kind == WAIT_CONDVAR && w->wait_addr == key) { any_left = true; break; }
+        if (!any_left) __atomic_store_n(u32p(key), 0, __ATOMIC_SEQ_CST);
+    }
     kev_add('w', key, (int32_t)r, 0);
     // Timed out / cancelled: the mutex is NOT held - as on Horizon (Atmosphere KConditionVariable::Wait; libnx
     // condvarWaitTimeout: "On timeout, we need to acquire it manually"). The SDK takes it again itself
@@ -499,6 +518,7 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
 
 static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, int64_t timeout, int32_t *index) {
     pthread_mutex_lock(&g_klock);
+    if (timeout >= 1000000000000000000LL) timeout = -1;
     struct timespec ts;
     if (timeout > 0) deadline(&ts, timeout);
     KThread *t = t_cur;
@@ -551,6 +571,8 @@ void kernel_unstick(void) {
     for (KThread *t = g_waitlist; t; t = t->wnext) {
         if (t->wait_kind != WAIT_CONDVAR) continue;
         n++;
+        uint64_t key = t->wait_addr;
+        __atomic_store_n(u32p(key), 0, __ATOMIC_SEQ_CST);
         t->wait_result = R_OK;
         if (mutex_acquire_or_mark(t->wait_mutex, t->wait_tag)) {
             t->wait_kind = WAIT_NONE;
