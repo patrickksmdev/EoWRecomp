@@ -3086,8 +3086,9 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
     vkey.stencil_tex = stencil_slots(0);
     fkey.stencil_tex = stencil_slots(1);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    bool critical = !indexed && !ind_buf && r->x[2] <= 6;
-    if (pr && atomic_load(&pr->state) == 0 && shader_mode() == SHADER_SMART && critical) {
+    bool critical = !ind_buf && r->x[2] <= 6;
+    int sm = shader_mode();
+    if (pr && atomic_load(&pr->state) == 0 && (sm == SHADER_SYNC || (sm == SHADER_SMART && critical))) {
         while (atomic_load(&pr->state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
     }
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return true; }
@@ -3286,7 +3287,7 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
     }
-    if (atomic_load(&pp->state) == 0 && shader_mode() == SHADER_SMART && critical) {
+    if (atomic_load(&pp->state) == 0 && (sm == SHADER_SYNC || (sm == SHADER_SMART && critical))) {
         while (atomic_load(&pp->state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
     }
     if (atomic_load(&pp->state) != 1) { SKIP(atomic_load(&pp->state) == 0 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED); return true; }
@@ -4302,8 +4303,8 @@ static void vk_prewarm_drain(void) {
         } else if ((np->stage_mask & 1) && (np->stage_mask & 2)) {
             ShaderKey vk = {0}, fk = {0};
             vk.glsl = fk.glsl = 1;
-            vk.flip_y = fk.flip_y = 1;
-            vk.depth_minus_one = 1;
+            vk.flip_y = fk.flip_y = nvn_window_origin() == 0;
+            vk.depth_minus_one = nvn_depth_mode() == 0;
             get_program(np, &vk, &fk);
         }
     }
