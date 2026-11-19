@@ -56,6 +56,7 @@ typedef struct {
 static Sub subs[SUBS];
 static int cur_sub;
 static void ss_forget(void);
+static void gw_prune(uint64_t done);
 static uint64_t submit_seq;  // last submitted
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
@@ -234,6 +235,7 @@ static Sub *sub(void) {
         wait_why = "ring slot";
         vk_wait_seq(s->seq);
         cq_resolve_done(s->seq);
+        gw_prune(s->seq);
         if (s->ts) {  // (profiling) GPU time of that submission
             uint64_t t[2];
             if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
@@ -2097,6 +2099,24 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
 #define GW_MAX 64
 static struct { uint64_t lo, hi, seq; } gw_tab[GW_MAX];
 static int gw_n;
+static uint64_t gw_min_lo, gw_max_hi, gw_done_seq;
+
+static void gw_prune(uint64_t done) {
+    if (done > gw_done_seq) gw_done_seq = done;
+    if (!gw_n) return;
+    int j = 0;
+    uint64_t min_lo = ~0ull, max_hi = 0;
+    for (int i = 0; i < gw_n; i++) {
+        if (gw_tab[i].seq <= gw_done_seq) continue;
+        gw_tab[j++] = gw_tab[i];
+        if (gw_tab[i].lo < min_lo) min_lo = gw_tab[i].lo;
+        if (gw_tab[i].hi > max_hi) max_hi = gw_tab[i].hi;
+    }
+    gw_n = j;
+    gw_min_lo = min_lo;
+    gw_max_hi = max_hi;
+}
+
 static void gw_mark(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
     uint64_t lo = addr, hi = addr + size, seq = vk_pending_seq();
@@ -2104,26 +2124,36 @@ static void gw_mark(uint64_t addr, uint64_t size) {
         if (gw_tab[i].lo == lo && gw_tab[i].hi == hi) { gw_tab[i].seq = seq; return; }
     }
     if (gw_n == GW_MAX) {
-        uint64_t done = vk_completed_seq();
-        int j = 0;
-        for (int i = 0; i < gw_n; i++) if (gw_tab[i].seq > done) gw_tab[j++] = gw_tab[i];
-        gw_n = j;
-        if (gw_n == GW_MAX) { memmove(gw_tab, gw_tab + 1, sizeof gw_tab[0] * (GW_MAX - 1)); gw_n--; }
+        gw_prune(vk_completed_seq());
+        if (gw_n == GW_MAX) {
+            memmove(gw_tab, gw_tab + 1, sizeof gw_tab[0] * (GW_MAX - 1));
+            gw_n--;
+            gw_prune(gw_done_seq);
+        }
+    }
+    if (!gw_n) { gw_min_lo = lo; gw_max_hi = hi; }
+    else {
+        if (lo < gw_min_lo) gw_min_lo = lo;
+        if (hi > gw_max_hi) gw_max_hi = hi;
     }
     gw_tab[gw_n].lo = lo; gw_tab[gw_n].hi = hi; gw_tab[gw_n].seq = seq;
     gw_n++;
 }
+
 static uint64_t gw_hit(uint64_t addr, uint64_t size) {
     if (!gw_n) return 0;
-    uint64_t done = vk_completed_seq(), hit = 0;
-    bool pending = false;
+    uint64_t end = addr + size;
+    if (end <= gw_min_lo || addr >= gw_max_hi) return 0;
+    uint64_t hit = 0;
     for (int i = 0; i < gw_n; i++) {
-        if (gw_tab[i].seq <= done) continue;
-        pending = true;
-        if (addr < gw_tab[i].hi && gw_tab[i].lo < addr + size && gw_tab[i].seq > hit) hit = gw_tab[i].seq;
+        if (gw_tab[i].seq <= gw_done_seq) continue;
+        if (addr < gw_tab[i].hi && gw_tab[i].lo < end && gw_tab[i].seq > hit) hit = gw_tab[i].seq;
     }
-    if (!pending) gw_n = 0;
-    return hit;
+    if (!hit) return 0;
+    if (hit >= vk_pending_seq()) return hit;  // current unsubmitted cmdbuf: cannot be completed yet
+    uint64_t done = vk_completed_seq();
+    gw_prune(done);
+    return hit > done ? hit : 0;
 }
 static bool gw_overlaps(uint64_t addr, uint64_t size) { return gw_hit(addr, size) != 0; }
 
@@ -2690,6 +2720,7 @@ void vk_exec_reset(void) {
     memset(pipe_tab, 0, sizeof pipe_tab);
     g_cs_n = 0;
     gw_n = 0;
+    gw_min_lo = gw_max_hi = gw_done_seq = 0;
     gcopy_gen++;
     if (gmem_buf) {
         if (gmem_placed) { vkUnmapMemory(g_vk.dev, gmem_mem); gmem_placed = false; }
