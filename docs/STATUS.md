@@ -1,6 +1,27 @@
 # Status
 
-Atualizado: 2026-11-14 (sessão 5: Windows/Vulkan — vegetação, corações, fenda; release beta_1).
+Atualizado: 2026-11-18 (sessão 6: Linux x86-64 / RX 7600 RADV — Rifts, freezes do árbitro, `VK_EXT_map_memory_placed`; release `v0.3.0`).
+
+## Sessão 6 (2026-11-16 a 2026-11-18): Linux x86-64 / AMD RX 7600 (RADV) — Rifts, estabilidade e performance (`v0.3.0`)
+
+Marco: M5 avançado (jogável até a **2ª dungeon — Gerudo Desert** com áudio, save/load, Rifts limpos e zero freezes). Backend testado: **Linux x86-64 / Vulkan (RADV)**; Windows x64 é gerado no CI (`release.yml`), sem teste local nesta sessão.
+
+### Corrigido e verificado nesta sessão
+- **Glitch visual ao sair de Rifts (`7e317ea3`, portado de `tcsenpai/EoWRecomp@97d8b3ed`):** `gw_tab` agora expira entradas já concluídas via `vk_completed_seq()` e `gw_before_cbufs()` sincroniza apenas quando `guest_live` não pode ser usado por alinhamento/limites, removendo o workaround por endereço fixo. Testado em Suthorn Forest e Gerudo Desert.
+- **Freezes aleatórios e falsos positivos (`99ea82c5`):** `ARB_DEC_WAIT_LESS`, `ARB_SIGNAL_INC_EQ` e `ARB_SIGNAL_MOD_EQ` em `runtime/kernel.c` passaram a usar `__atomic_compare_exchange_n` (CAS), eliminando corridas no árbitro; o watchdog em `runtime/platform/linux.c` subiu de 500 ms para 2 s com `kernel_dump_threads()` antes do `kernel_unstick()`. Verificado em log: **0 `unstick`** em 459 s / 38.553 frames e >2 h de jogo contínuo.
+- **Gargalo de `vkQueueSubmit2` no RADV/AMDGPU + `draw_()` (`8fc8db0f`):**
+  - Substituído `VK_EXT_external_memory_host` (`userptr`, que fazia o kernel `amdgpu` validar 3,2 GB a cada submit: `1,36–5,02 ms/submit`) por memória GTT nativa (`HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`) mapeada em `HEAP_BASE` com **`VK_EXT_map_memory_placed` + `VK_KHR_map_memory2`** (`0,027 ms/submit`, ~50× menor), mantendo `gmem_import` como fallback.
+  - Cache de `stencil_slots(stage)` invalidado por geração de texture pool (`nvn_tpool_gen`) / binds, e gating dos hashes FNV-1a de VS/FS e do scan de bisect (`F10`) em `draw_()` (`pre` de `4,55 µs` → `3,45–4,15 µs/draw`).
+  - Medido em `build/prof.log` (área aberta, RX 7600): **~66 FPS → 91–116 FPS** (`max 10 ms`, `pace 60`).
+- **Release & CI (`c97af6a7`, `de55d550`):** versão atualizada para `v0.3.0` e adicionado `.github/workflows/release.yml` para gerar AppImage Linux x86-64 + pacote Windows x64 automaticamente em tags `v*`.
+
+### Experimentos descartados (revertidos)
+- **Prewarm síncrono em `nvnProgramSetShaders`**, **`VK_EXT_graphics_pipeline_library` (GPL)** e **cache de descriptor sets `ds_cache[2048]` por submission**: todos pioraram FPS ou adicionaram contention/cache misses frente ao pipeline monolítico + `stage_set()` atual.
+
+### Próximo passo
+1. Continuar a progressão após a 2ª dungeon (Gerudo Desert) verificando novos shaders/SVCs/serviços IPC.
+2. Investigar os 2 opcodes de fragment shader sem tradução que aparecem no boot (`df02022020770600` e `c8380226aff70400`).
+3. Validar em uma máquina Windows o pacote `EoWRecomp-v0.3.0-windows-x86_64.zip` gerado pelo CI.
 
 ## Sessão 5 (2026-11-10 a 2026-11-14): Windows / Radeon RX 580 / Vulkan — vegetação, HUD, fenda do vazio; release beta_1
 
