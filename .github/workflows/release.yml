@@ -46,6 +46,8 @@ jobs:
     needs: [windows, linux]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: EoWRecomp-windows-x64
@@ -65,6 +67,21 @@ jobs:
           mkdir -p out
           cp artifacts/linux/*.AppImage out/
           (cd artifacts/win && zip -r "../../out/EoWRecomp-${TAG}-windows-x86_64.zip" EoWRecomp)
+          python3 -c '
+          import json, sys
+          tag = sys.argv[1]
+          with open("recomplauncher.json") as f:
+              data = json.load(f)
+          appimage = f"EoWRecomp-{tag}-linux-x86_64.AppImage"
+          prog = data.get("start", {}).get("program", [])
+          data.setdefault("start", {})["program"] = [
+              p if not p.endswith(".AppImage") or "EoWRecomp-linux-" in p else appimage
+              for p in prog
+          ]
+          with open("out/recomplauncher.json", "w") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+          ' "$TAG"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --title "EoWRecomp ${TAG}" --generate-notes
           fi

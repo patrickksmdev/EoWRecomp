@@ -31,11 +31,11 @@ EoWRecomp translates the game's ARM64 machine code into C ahead of time and reco
 ## Linux progress (`v0.3.0`)
 
 - **Tested playable through the 2nd dungeon (Gerudo Desert):** intro, Hyrule Castle Town, Suthorn Village, Still World (Rifts), 2D sections, first dungeon, and Gerudo Desert dungeon with audio, working save/load, and zero freezes.
-- **Placed-memory guest heap (`VK_EXT_map_memory_placed`) & CPU draw optimizations:** maps host-cached GTT memory directly at `HEAP_BASE` (eliminating per-submit `amdgpu` userptr overhead on Linux RADV, `~50x` faster `vkQueueSubmit2`), plus cached `stencil_slots()` masks and gated debug checks in `draw_()` (**~66 FPS → 91–116 FPS** in heavy open areas on RX 7600).
+- **Placed-memory guest heap (`VK_EXT_map_memory_placed`) & CPU draw optimizations:** maps host-cached GTT memory directly at `HEAP_BASE` (eliminating per-submit `amdgpu` userptr overhead on Linux RADV, `~50x` faster `vkQueueSubmit2`), plus cached `stencil_slots()` masks, gated debug checks in `draw_()`, and `gw_hit()` bounding-box fast-reject + completed-sequence cache (**~66 FPS → 91–116 FPS** in open areas; **46–50 FPS → 99.8–120 FPS** in heavy draw areas on RX 7600).
 - **Rift / Void rendering fix:** submission-tracked GPU-written buffer lifetimes (`gw_tab`, ported from `tcsenpai/EoWRecomp`) fix visual glitches after exiting Rift areas without address-specific workarounds.
-- **Atomic kernel arbiter & 2 s watchdog:** replaced non-atomic load+store arbiter updates with atomic CAS in `runtime/kernel.c` and raised the Linux watchdog threshold to 2 s with thread dumps before `kernel_unstick()`.
+- **Kernel condvar & watchdog fixes:** fixed `svc_wait_process_wide_key()` lost wake-up, `block_current()` `TimedWait` vs `Signal` race, atomic CAS arbiter updates in `runtime/kernel.c`, and duplicate Linux watchdog registration (**0 `unstick`** in 272 s+ sessions).
 - **GPU-side indirect draws (`vkCmdDrawIndirect` / `vkCmdDrawIndexedIndirect`):** eliminated mid-frame CPU flush stalls and added live tracking for GPU-written constant buffers.
-- **Smart shader compilation & pre-warming:** pre-warms shaders on `nvnProgramSetShaders` during loading and waits synchronously only on critical fullscreen/compute passes (`Smart` / `Sync` / `Async` selectable in the `F1` menu).
+- **Smart shader compilation & pre-warming:** pre-warms shaders on `nvnProgramSetShaders` using the active window origin/depth mode and waits synchronously on critical fullscreen/compute passes (`Smart` / `Sync` / `Async` selectable in the `F1` menu), eliminating lighting/scene flicker.
 - **VSync & FPS limit:** toggle VSync and cap FPS (`30` / `60` / `120` / `Unlimited`) from the `F1` → **Display** menu.
 - **XCI extraction & AppImage:** HFS0 `.xci` support in `tools/nca_extract.py` and standalone x86-64 AppImages (`build/dist/EoWRecomp-v0.3.0-linux-x86_64.AppImage`).
 
@@ -66,21 +66,13 @@ tools/linux/appimage.sh x86_64
 - **Graphics**: reimplements NVN on Vulkan and translates Maxwell GPU shaders to GLSL.
 - **Game package reader** (`runtime/nxpkg.c`): reads NSP/XCI/NCA packages using the user's keys. The RomFS can be read directly from the package instead of requiring a second multi-gigabyte copy.
 
-## Release status: handing the project over
-
-This is **beta 1**: a starting point for developers, not a finished game. The game boots, renders most of the world and is playable on the
-test PC, with the open issues listed above. Everything needed to continue is in the repository:
+## Contributing & Debugging
 
 - `docs/STATUS.md` is the detailed engineering log (in Portuguese): what works, what broke, hypotheses ruled out, and next steps.
-- `CLAUDE.md` holds the project rules (no Nintendo files in the repo, never edit `generated/` by hand, every patch checks the original
-  instruction word, a fix counts only once seen working).
+- `CLAUDE.md` holds the project rules (no Nintendo files in the repo, never edit `generated/` by hand, every patch checks the original instruction word, a fix counts only once seen working).
 - Tests live in `tools/` (`test_translate`, `test_shaders`, `test_simd`, `test_lift`, `test_lane.sh`, `test_stencil.sh`).
-- **F9 debug capture:** press F9 in game to save the next frame's render passes (`build/pass_*.png`), the draw log, and, with
-  `EOWRECOMP_SAVE_MSL=1`, the translated GLSL in `build/shaders`. This is how the rift and vegetation bugs were found.
+- **F9 debug capture:** press F9 in game to save the next frame's render passes (`build/pass_*.png`), the draw log, and, with `EOWRECOMP_SAVE_MSL=1`, the translated GLSL in `build/shaders`.
 - Debug switches all start with `EOWRECOMP_` (search `getenv("EOWRECOMP_` in `runtime/`).
-
-Suggested next steps for contributors: finish the rift fill, move indirect draw arguments to the GPU, find the freeze's root cause, then
-validate the Metal backend.
 
 ## Development status
 

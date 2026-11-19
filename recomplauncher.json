@@ -1,0 +1,14 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "repo": "patrickksmdev/EoWRecomp",
+  "start": {
+    "program": [
+      "EoWRecomp/eowrecomp.exe",
+      "eowrecomp.exe",
+      "EoWRecomp-v0.3.0-linux-x86_64.AppImage",
+      "EoWRecomp-linux-x86_64.AppImage",
+      "eowrecomp"
+    ]
+  }
+}
