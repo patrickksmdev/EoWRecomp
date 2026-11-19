@@ -91,7 +91,7 @@ See **[docs/STATUS.md](docs/STATUS.md)** for the detailed technical log:
 - [SDL 3](https://libsdl.org), [FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui), [Vulkan](https://www.vulkan.org), [volk](https://github.com/zeux/volk), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [shaderc](https://github.com/google/shaderc), [SMAA](https://github.com/iryoku/smaa) and [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR).
 - Documentation and research references: [Switchbrew](https://switchbrew.org), [envytools](https://github.com/envytools/envytools), and the instruction decoders of Ryujinx and yuzu.
 
-This project is developed with AI assistance from [Claude](https://www.anthropic.com/claude) (Anthropic), under human direction and testing. Commits made with Claude carry a `Co-Authored-By` trailer.
+This fork is developed with AI assistance from [Gemini](https://gemini.google.com) (Google), under human direction and testing (upstream base was developed with Claude).
 
 ## Legal
 
