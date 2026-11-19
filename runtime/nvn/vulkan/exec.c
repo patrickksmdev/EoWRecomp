@@ -2080,25 +2080,78 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
-// Ranges written by storing shaders (cs/vs/fs) or ClearBuffer: cbuf_info reads them live on the GPU instead of
-// taking a stale CPU snapshot before the submission finishes.
-static Range gw_tab[128];
+// Ranges written by storing shaders (cs/vs/fs) or ClearBuffer in unfinished submissions: cbuf_info reads them live on
+// the GPU when alignment allows, or gw_before_cbufs flushes/waits before guest_copy takes a CPU snapshot.
+#define GW_MAX 64
+static struct { uint64_t lo, hi, seq; } gw_tab[GW_MAX];
 static int gw_n;
 static void gw_mark(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    uint64_t lo = addr, hi = addr + size, seq = vk_pending_seq();
     for (int i = 0; i < gw_n; i++) {
-        if (gw_tab[i].addr <= addr && gw_tab[i].addr + gw_tab[i].size >= addr + size) return;
-        if (addr <= gw_tab[i].addr && addr + size >= gw_tab[i].addr + gw_tab[i].size) { gw_tab[i] = (Range){addr, size}; return; }
+        if (gw_tab[i].lo == lo && gw_tab[i].hi == hi) { gw_tab[i].seq = seq; return; }
     }
-    if (gw_n < 128) gw_tab[gw_n++] = (Range){addr, size};
+    if (gw_n == GW_MAX) {
+        uint64_t done = vk_completed_seq();
+        int j = 0;
+        for (int i = 0; i < gw_n; i++) if (gw_tab[i].seq > done) gw_tab[j++] = gw_tab[i];
+        gw_n = j;
+        if (gw_n == GW_MAX) { memmove(gw_tab, gw_tab + 1, sizeof gw_tab[0] * (GW_MAX - 1)); gw_n--; }
+    }
+    gw_tab[gw_n].lo = lo; gw_tab[gw_n].hi = hi; gw_tab[gw_n].seq = seq;
+    gw_n++;
 }
-static bool gw_overlaps(uint64_t addr, uint64_t size) {
-    for (int i = 0; i < gw_n; i++)
-        if (addr < gw_tab[i].addr + gw_tab[i].size && gw_tab[i].addr < addr + size) return true;
-    return false;
+static uint64_t gw_hit(uint64_t addr, uint64_t size) {
+    if (!gw_n) return 0;
+    uint64_t done = vk_completed_seq(), hit = 0;
+    bool pending = false;
+    for (int i = 0; i < gw_n; i++) {
+        if (gw_tab[i].seq <= done) continue;
+        pending = true;
+        if (addr < gw_tab[i].hi && gw_tab[i].lo < addr + size && gw_tab[i].seq > hit) hit = gw_tab[i].seq;
+    }
+    if (!pending) gw_n = 0;
+    return hit;
 }
+static bool gw_overlaps(uint64_t addr, uint64_t size) { return gw_hit(addr, size) != 0; }
 
 static bool guest_live(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);
+
+static bool gw_can_live(uint64_t addr, uint64_t size) {
+    static int live = -1;
+    if (live < 0) { const char *e = getenv("EOWRECOMP_VK_LIVE_UBO"); live = !e || atoi(e) != 0; }
+    if (!live) return false;
+    VkBuffer lb;
+    VkDeviceSize lo;
+    uint64_t al = g_vk.props.limits.minUniformBufferOffsetAlignment;
+    return guest_live(addr, size, &lb, &lo) && (!al || lo % al == 0);
+}
+
+static void gw_before_cbufs(Prog *pr) {
+    if (!gw_n) return;
+    uint64_t need = 0;
+    ShaderInfo *si[2] = {pr->vi, pr->fi};
+    for (int sg = 0; sg < 2; sg++)
+        for (int k = 3; k < 18; k++) {
+            if (!((si[sg]->cbuf_mask >> k) & 1)) continue;
+            Range r = st.ubuf[sg][k - 3];
+            if (!r.addr) continue;
+            uint64_t size = si[sg]->cbuf_size[k] ? si[sg]->cbuf_size[k] : 256;
+            if ((si[sg]->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
+            if (size > r.size && r.size) size = r.size;
+            if (size < 16) size = 16;
+            uint64_t s = gw_hit(r.addr, size);
+            if (s > need && !gw_can_live(r.addr, size)) {
+                need = s;
+                static int nlog;
+                if (nlog++ < 8) LOG("[vk] constant buffer %llx (%llu B, stage %d c%d) written by storing shader: waited for\n",
+                                    (unsigned long long)r.addr, (unsigned long long)size, sg, k);
+            }
+        }
+    if (!need) return;
+    if (need >= vk_pending_seq()) { vk_end_pass(); renderer_flush(); st.rt_dirty = true; }
+    else vk_wait_seq(need);
+}
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -2876,9 +2929,6 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
     if (writes_image) vk_full_barrier(cb);  // (the next pass samples what SUST wrote)
-    // Suthorn Rift: exiting a rift area leaves the 72a46fe000/72a4705000/72a470d000 compute trio's output out of sync
-    // with the subsequent rift mask draw (vs 72a7160000) unless flushed once here.
-    if (st.program->stages[5].code_addr == 0x72a470d000ull) renderer_flush();
     stat_dispatches++;
 }
 
@@ -3064,6 +3114,7 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
     }
     if (g_debug_frame && !ind_buf) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
+    gw_before_cbufs(pr);
     alias_draw_check();
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
