@@ -1,6 +1,27 @@
 # Status
 
-Atualizado: 2026-11-18 (sessão 6: Linux x86-64 / RX 7600 RADV — Rifts, freezes do árbitro, `VK_EXT_map_memory_placed`; release `v0.3.0`).
+Atualizado: 2026-11-19 (sessão 7: Linux x86-64 / RX 7600 RADV — correção de piscadas de shader, lost wake-up / self-deadlock no `kernel.c`, watchdog duplicado no Linux e fast-reject em `gw_hit()`).
+
+## Sessão 7 (2026-11-19): Linux x86-64 / AMD RX 7600 (RADV) — Shaders, `unstick` no kernel e otimização de CPU (`gw_hit`)
+
+### Corrigido e verificado nesta sessão
+- **Piscadas de cenário/iluminação no modo `smart` (`75af504e`):**
+  - `vk_prewarm_drain()` em `runtime/nvn/vulkan/exec.c` usava `flip_y = 1` e `depth_minus_one = 1` fixos em vez de `nvn_window_origin() == 0` / `nvn_depth_mode() == 0`, pré-compilando variantes erradas que `draw_()` nunca usava.
+  - `SHADER_SYNC` passou a aguardar quando `pr->state == 0` ou `pp->state == 0` (mesmo após prewarm assíncrono), e `SHADER_SMART` passou a considerar críticos draws indexados de até 6 índices (`!ind_buf && r->x[2] <= 6`, como passes fullscreen de iluminação).
+- **Causa raiz do freeze / `*** unstick` e watchdog duplicado (`3f8abb4a`):**
+  - **Lost wake-up em `svc_wait_process_wide_key()` (`runtime/kernel.c`):** `mutex_release(mutex)` rodava antes de `*key = 1`, permitindo que outro core pegasse o mutex em user-space, enfileirasse jobs, destravasse, lesse `*key == 0` e pulasse `svcSignalProcessWideKey`. Agora `wait_kind = WAIT_CONDVAR` e `*key = 1` (`__ATOMIC_SEQ_CST`) são publicados antes de liberar o mutex.
+  - **Race `TimedWait` vs `Signal`/`Unstick` em `block_current()` (`runtime/kernel.c`):** ao expirar `kwait()`, `block_current()` não rechecando `wait_kind` sobrescrevia `R_OK` com `R_TIMEOUT` mesmo após a posse do mutex já ter sido entregue (causando auto-deadlock em `t88`). Agora preserva `R_OK` se `WAIT_NONE`, continua sem timeout se já virou `WAIT_MUTEX`, usa `wait_tag` em `mutex_release()` e limpa `*key = 0` em `kernel_unstick()`.
+  - **Watchdog duplicado no Linux (`runtime/platform/linux.c`):** `plat_crash_handler_install()` passou a instalar `sigaction` e iniciar `watchdog_thread` apenas uma vez por processo (mantendo `sigaltstack()` por thread).
+  - Verificado em `build/run.log`: **0 `unstick`** em ~272 s de jogo.
+- **Gargalo de CPU em áreas pesadas (`ac1639e8`):**
+  - `gw_hit()` em `runtime/nvn/vulkan/exec.c` chamava `vk_completed_seq()` (`vkGetSemaphoreCounterValue`) antes de verificar sobreposição em `gw_tab`, gerando alto overhead em `gw_before_cbufs()` e `cbuf_info()` (~900–1.016 ms / 2 s em áreas com ~95k draws / 2 s).
+  - Adicionados fast-reject por bounding box (`gw_min_lo`..`gw_max_hi`), cache de sequência concluída (`gw_done_seq`) podado na reutilização de slots em `sub()`, e consulta ao driver apenas em colisão real de submissão já enviada.
+  - Medido em `build/run.log` (área pesada, RX 7600): `pre(snap)` caiu de **509–525 ms → 6–36 ms** / 2 s, `sets(cbuf)` de **481–491 ms → 30–127 ms** / 2 s, e o framerate subiu de **46–50 FPS (`pace 30`) → 99,8–120,0 FPS (`pace 60`)**.
+
+### Próximo passo
+1. Continuar a progressão após a 2ª dungeon (Gerudo Desert) verificando novos shaders/SVCs/serviços IPC.
+2. Investigar os 2 opcodes de fragment shader sem tradução que aparecem no boot (`df02022020770600` e `c8380226aff70400`).
+3. Validar em uma máquina Windows o pacote gerado pelo CI (`release.yml`).
 
 ## Sessão 6 (2026-11-16 a 2026-11-18): Linux x86-64 / AMD RX 7600 (RADV) — Rifts, estabilidade e performance (`v0.3.0`)
 
