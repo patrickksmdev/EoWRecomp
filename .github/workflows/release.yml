@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.3.0; defaults to current ref)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    uses: ./.github/workflows/build-windows.yml
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install podman
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends podman
+          fi
+
+      - name: Build Linux x86_64 AppImage
+        run: |
+          chmod +x tools/linux/*.sh tools/fetch_zig.sh
+          tools/linux/appimage.sh x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EoWRecomp-linux-x64
+          path: build/dist/*.AppImage
+          if-no-files-found: error
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: EoWRecomp-windows-x64
+          path: artifacts/win
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: EoWRecomp-linux-x64
+          path: artifacts/linux
+
+      - name: Package and upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          mkdir -p out
+          cp artifacts/linux/*.AppImage out/
+          (cd artifacts/win && zip -r "../../out/EoWRecomp-${TAG}-windows-x86_64.zip" EoWRecomp)
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "EoWRecomp ${TAG}" --generate-notes
+          fi
+          gh release upload "$TAG" out/* --clobber

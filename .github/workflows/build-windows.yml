@@ -9,6 +9,7 @@ name: Build Windows
 # Não há arquivos do jogo nem código gerado nele: isso vem dos arquivos do próprio usuário.
 
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     branches: [main]
