@@ -717,6 +717,10 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         heap_size = size;
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);
+#ifndef EOW_METAL
+        extern void backend_set_heap_size(uint64_t size);
+        backend_set_heap_size(size);
+#endif
         x[0] = R_OK;
         x[1] = HEAP_BASE;
         break;

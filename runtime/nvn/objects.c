@@ -429,6 +429,7 @@ NVN(nvnTextureViewSetSwizzle) {
     v->swizzle[0] = (uint8_t)A(1); v->swizzle[1] = (uint8_t)A(2); v->swizzle[2] = (uint8_t)A(3); v->swizzle[3] = (uint8_t)A(4);
 }
 uint32_t nvn_stencil_views;  // views ever set to STENCIL mode (renderer: skip the per-draw stencil-slot scan while 0)
+uint64_t nvn_tpool_gen;  // bumped on texture-pool registration to invalidate cached stencil slot masks
 NVN(nvnTextureViewSetDepthStencilMode) { NvnTextureView *v = AP(0); v->setmask |= 16; v->ds_mode = (uint32_t)A(1); if (v->ds_mode == 1) nvn_stencil_views++; }
 NVN(nvnTextureViewSetTarget) { NvnTextureView *v = AP(0); v->setmask |= 32; v->target = (uint32_t)A(1); }
 NVN(nvnTextureViewGetLevels) { *(int32_t *)AP(1) = TV(uint16_t, 4); *(int32_t *)AP(2) = TV(uint16_t, 6); RET(TV(uint32_t, 0) & 1); }
@@ -567,6 +568,7 @@ static void register_texture(Cpu *c) {
     e->tex = HOST(NvnTexture, A(2));
     e->has_view = A(3) != 0;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    __atomic_add_fetch(&nvn_tpool_gen, 1, __ATOMIC_RELEASE);
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
 NVN(nvnTexturePoolRegisterImage) { register_texture(c); }

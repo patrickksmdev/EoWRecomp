@@ -219,6 +219,10 @@ int main(int argc, char **argv) {
             extern void launcher_run(const char *root);
             launcher_run(root);
         }
+#ifndef EOW_METAL
+        extern void ui_window_init(void);
+        ui_window_init();
+#endif
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();

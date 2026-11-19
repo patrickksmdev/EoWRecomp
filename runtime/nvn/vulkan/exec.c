@@ -805,6 +805,10 @@ static struct {
     Range vbuf[16], ubuf[6][18], sbuf[6][16];
     uint64_t tex[6][32], img[6][8];
     NvnDescPool *tpool, *spool;
+    uint32_t sten_mask[6];
+    uint64_t sten_gen[6];
+    NvnDescPool *sten_pool[6];
+    uint8_t sten_valid[6];
     float viewport[16][4];
     int32_t scissor[16][4];
     float depth_range[16][2];
@@ -1380,6 +1384,7 @@ static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 // (72a71bb500) samples the depth-stencil buffer's stencil and tests bits 5/6 of it with R2P: a float depth sample gave it
 // garbage and the ribbon came out as thin dashes.
 extern uint32_t nvn_stencil_views;
+extern uint64_t nvn_tpool_gen;
 static NvnTexEntry *tex_entry(int stage, int slot) {
     uint64_t h = st.tex[stage][slot];
     uint32_t tic = h & 0xFFFFF;
@@ -1389,12 +1394,19 @@ static NvnTexEntry *tex_entry(int stage, int slot) {
 }
 
 static uint32_t stencil_slots(int stage) {
-    uint32_t m = 0;
     if (!nvn_stencil_views) return 0;
+    uint64_t gen = __atomic_load_n(&nvn_tpool_gen, __ATOMIC_ACQUIRE);
+    if (st.sten_valid[stage] && st.sten_gen[stage] == gen && st.sten_pool[stage] == st.tpool)
+        return st.sten_mask[stage];
+    uint32_t m = 0;
     for (int s = 0; s < 32; s++) {
         NvnTexEntry *e = tex_entry(stage, s);
         if (e && vk_samples_stencil(e->tex, &e->view, e->has_view)) m |= 1u << s;
     }
+    st.sten_mask[stage] = m;
+    st.sten_gen[stage] = gen;
+    st.sten_pool[stage] = st.tpool;
+    st.sten_valid[stage] = 1;
     return m;
 }
 
@@ -2220,8 +2232,69 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static bool gmem_placed;
+
+static uint32_t find_placed_mem_type(uint32_t type_bits) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    uint32_t fallback = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (!(type_bits & (1u << i))) continue;
+        if ((mp.memoryTypes[i].propertyFlags & want) != want) continue;
+        if (!(mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return i;
+        if (fallback == UINT32_MAX) fallback = i;
+    }
+    return fallback;
+}
+
+// Allocate native Vulkan GTT memory and map it directly at HEAP_BASE via VK_EXT_map_memory_placed,
+// avoiding AMDGPU userptr validation on every vkQueueSubmit2.
+static bool gmem_map_placed(uint64_t size) {
+    if (!g_vk.map_placed || gmem_buf) return false;
+    PFN_vkMapMemory2KHR map2 = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev, "vkMapMemory2KHR");
+    if (!map2) return false;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
+    VkBuffer buf;
+    if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &req);
+    if (req.size > HEAP_MAX) { vkDestroyBuffer(g_vk.dev, buf, NULL); return false; }
+    uint32_t mt = find_placed_mem_type(req.memoryTypeBits);
+    if (mt == UINT32_MAX) { vkDestroyBuffer(g_vk.dev, buf, NULL); return false; }
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = mt};
+    VkDeviceMemory mem;
+    if (vkAllocateMemory(g_vk.dev, &ai, NULL, &mem) != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, buf, NULL); return false; }
+    if (vkBindBufferMemory(g_vk.dev, buf, mem, 0) != VK_SUCCESS) {
+        vkFreeMemory(g_vk.dev, mem, NULL);
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        return false;
+    }
+    VkMemoryMapPlacedInfoEXT placed = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT,
+                                       .pPlacedAddress = (void *)(uintptr_t)HEAP_BASE};
+    VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &placed,
+                             .flags = VK_MEMORY_MAP_PLACED_BIT_EXT, .memory = mem, .offset = 0, .size = VK_WHOLE_SIZE};
+    void *mapped = NULL;
+    if (map2(g_vk.dev, &mi, &mapped) != VK_SUCCESS || mapped != (void *)(uintptr_t)HEAP_BASE) {
+        if (mapped) vkUnmapMemory(g_vk.dev, mem);
+        vkFreeMemory(g_vk.dev, mem, NULL);
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        return false;
+    }
+    gmem_buf = buf;
+    gmem_mem = mem;
+    gmem_size = size;
+    gmem_placed = true;
+    LOG("[vk] guest heap placed-mapped for shader global memory: %llu MB\n", (unsigned long long)(size >> 20));
+    return true;
+}
 
 static bool gmem_import(uint64_t size) {
+    if (gmem_placed) return false;
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
         (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetMemoryHostPointerPropertiesEXT");
     VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -2257,6 +2330,11 @@ static bool gmem_import(uint64_t size) {
 }
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
+
+void backend_set_heap_size(uint64_t size) {
+    if (!size || size > HEAP_MAX || getenv("EOWRECOMP_VK_NO_GMEM") || !g_vk.dev || !g_vk.map_placed || gmem_buf) return;
+    if (gmem_map_placed(size)) gmem_tried = size;
+}
 
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
@@ -2614,6 +2692,7 @@ void vk_exec_reset(void) {
     gw_n = 0;
     gcopy_gen++;
     if (gmem_buf) {
+        if (gmem_placed) { vkUnmapMemory(g_vk.dev, gmem_mem); gmem_placed = false; }
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
         gmem_buf = VK_NULL_HANDLE;
@@ -3024,13 +3103,7 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
         }
     }
     {   // fragment-shader hash: skip lists (EOWRECOMP_SKIP_FSHASH), debug logging
-        static uint64_t last_fs, last_hash;
-        uint64_t fs = st.program->stages[1].code_addr;
-        if (fs != last_fs) {
-            last_fs = fs;
-            last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
-        }
-        static uint64_t skip[16];
+        static uint64_t last_fs, last_hash, skip[16];
         static int nskip = -1;
         if (nskip < 0) {
             nskip = 0;
@@ -3039,16 +3112,8 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
                 while (*p == ',') p++;
             }
         }
-        for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { SKIP(SKIP_LIST); return true; }
-        // Same for the vertex shader (EOWRECOMP_SKIP_VSHASH): the main characters share one fragment shader, so only the vertex
-        // shader tells the skinned meshes apart when hunting the stretched part (2026-11-10).
         static uint64_t last_vs, last_vhash, vskip[16];
         static int nvskip = -1;
-        uint64_t vs = st.program->stages[0].code_addr;
-        if (vs != last_vs) {
-            last_vs = vs;
-            last_vhash = vs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(vs + 0x30), 0x200) : 0;
-        }
         if (nvskip < 0) {
             nvskip = 0;
             for (const char *p = getenv("EOWRECOMP_SKIP_VSHASH"); p && *p && nvskip < 16;) {
@@ -3056,10 +3121,6 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
                 while (*p == ',') p++;
             }
         }
-        for (int i = 0; i < nvskip; i++) if (last_vhash == vskip[i]) { SKIP(SKIP_LIST); return true; }
-        // EOWRECOMP_SKIP_VSPROG=a1,a2,...: skip by vertex-shader address (the [draw] lines' "vs=..."). The hash above covers only the
-        // first 0x200 bytes, so every variant of the depth pre-pass shares one hash and the hunt for the pre-pass draw that writes
-        // the wrong depth around the rift portal (2026-11-13) cannot tell them apart.
         static uint64_t pskip[32];
         static int npskip = -1;
         if (npskip < 0) {
@@ -3069,10 +3130,26 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
                 while (*p == ',') p++;
             }
         }
+        uint64_t fs = st.program->stages[1].code_addr;
+        uint64_t vs = st.program->stages[0].code_addr;
         for (int i = 0; i < npskip; i++) if (vs == pskip[i]) { SKIP(SKIP_LIST); return true; }
-        g_cur_vs_hash = last_vhash;
+        bool need_fs_hash = nskip > 0 || g_debug_frame || g_gpuprof_frame || ct_on();
+        if (need_fs_hash && fs != last_fs) {
+            last_fs = fs;
+            last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+        }
+        for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { SKIP(SKIP_LIST); return true; }
+        // Same for the vertex shader (EOWRECOMP_SKIP_VSHASH): the main characters share one fragment shader, so only the vertex
+        // shader tells the skinned meshes apart when hunting the stretched part (2026-11-10).
+        bool need_vs_hash = nvskip > 0 || g_debug_frame;
+        if (need_vs_hash && vs != last_vs) {
+            last_vs = vs;
+            last_vhash = vs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(vs + 0x30), 0x200) : 0;
+        }
+        for (int i = 0; i < nvskip; i++) if (last_vhash == vskip[i]) { SKIP(SKIP_LIST); return true; }
+        g_cur_vs_hash = need_vs_hash ? last_vhash : 0;
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
-        g_cur_fs_hash = last_hash;
+        g_cur_fs_hash = need_fs_hash ? last_hash : 0;
     }
     {   // Bisect for the draw that makes the stretched beam (2026-11-11). The F10 mesh-by-mesh stepper filled up with enemies and
         // scenery before Link's meshes showed up and never found it, so: every distinct draw (vertex shader + index count) is a
@@ -3081,35 +3158,39 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
         extern volatile int g_skin_skip_request, g_bisect_gone, g_bisect_still;
         static uint64_t keys[2048];
         static int nkeys, frozen, lo, hi, slo, shi, h_f10, h_gone, h_still;
-        uint64_t key = (st.program->stages[0].code_addr << 20) ^ (uint64_t)r->x[2];
-        if (!frozen && nkeys < 2048) {
-            int j = 0;
-            while (j < nkeys && keys[j] != key) j++;
-            if (j == nkeys) keys[nkeys++] = key;
-        }
-        if (g_skin_skip_request != h_f10) {  // start (freeze the candidate list) / re-test the current half
-            h_f10 = g_skin_skip_request;
-            if (!frozen) { frozen = 1; lo = 0; hi = nkeys; LOG("[bisect] %d candidate draws\n", nkeys); }
-            slo = lo; shi = lo + (hi - lo + 1) / 2;
-            LOG("[bisect] skipping candidates %d..%d of %d..%d\n", slo, shi - 1, lo, hi - 1);
-        }
-        if (frozen && (g_bisect_gone != h_gone || g_bisect_still != h_still)) {
-            if (g_bisect_gone != h_gone) hi = shi;  // beam vanished: it is among the skipped
-            else lo = shi;                          // beam stayed: it is among the others
-            h_gone = g_bisect_gone; h_still = g_bisect_still;
-            if (hi - lo <= 1) {
-                slo = lo; shi = hi;
-                LOG("[bisect] FOUND candidate %d: vs %llx, index count %llu (all other draws drawn)\n", lo,
-                    (unsigned long long)(keys[lo] >> 20), (unsigned long long)(keys[lo] & 0xFFFFF));
-            } else {
-                slo = lo; shi = lo + (hi - lo + 1) / 2;
-                LOG("[bisect] now %d..%d: skipping %d..%d", lo, hi - 1, slo, shi - 1);
-                if (hi - lo <= 12) for (int q = lo; q < hi; q++) LOG(" [%d vs %llx n %llu]", q, (unsigned long long)(keys[q] >> 20), (unsigned long long)(keys[q] & 0xFFFFF));
-                LOG("\n");
+        static int bisect_on = -1;
+        if (bisect_on < 0) bisect_on = getenv("EOWRECOMP_BISECT") != NULL;
+        if (bisect_on || g_skin_skip_request != h_f10 || frozen) {
+            uint64_t key = (st.program->stages[0].code_addr << 20) ^ (uint64_t)r->x[2];
+            if (!frozen && nkeys < 2048) {
+                int j = 0;
+                while (j < nkeys && keys[j] != key) j++;
+                if (j == nkeys) keys[nkeys++] = key;
             }
-        }
-        if (frozen && shi > slo) {
-            for (int q = slo; q < shi; q++) if (keys[q] == key) { SKIP(SKIP_LIST); return true; }
+            if (g_skin_skip_request != h_f10) {  // start (freeze the candidate list) / re-test the current half
+                h_f10 = g_skin_skip_request;
+                if (!frozen) { frozen = 1; lo = 0; hi = nkeys; LOG("[bisect] %d candidate draws\n", nkeys); }
+                slo = lo; shi = lo + (hi - lo + 1) / 2;
+                LOG("[bisect] skipping candidates %d..%d of %d..%d\n", slo, shi - 1, lo, hi - 1);
+            }
+            if (frozen && (g_bisect_gone != h_gone || g_bisect_still != h_still)) {
+                if (g_bisect_gone != h_gone) hi = shi;  // beam vanished: it is among the skipped
+                else lo = shi;                          // beam stayed: it is among the others
+                h_gone = g_bisect_gone; h_still = g_bisect_still;
+                if (hi - lo <= 1) {
+                    slo = lo; shi = hi;
+                    LOG("[bisect] FOUND candidate %d: vs %llx, index count %llu (all other draws drawn)\n", lo,
+                        (unsigned long long)(keys[lo] >> 20), (unsigned long long)(keys[lo] & 0xFFFFF));
+                } else {
+                    slo = lo; shi = lo + (hi - lo + 1) / 2;
+                    LOG("[bisect] now %d..%d: skipping %d..%d", lo, hi - 1, slo, shi - 1);
+                    if (hi - lo <= 12) for (int q = lo; q < hi; q++) LOG(" [%d vs %llx n %llu]", q, (unsigned long long)(keys[q] >> 20), (unsigned long long)(keys[q] & 0xFFFFF));
+                    LOG("\n");
+                }
+            }
+            if (frozen && shi > slo) {
+                for (int q = slo; q < shi; q++) if (keys[q] == key) { SKIP(SKIP_LIST); return true; }
+            }
         }
     }
     if (g_debug_frame && !ind_buf) debug_draw(pr, r, indexed);
@@ -4273,12 +4354,13 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
                 memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+            if (r->x[0] < 6) st.sten_valid[r->x[0]] = 0;
             break;
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
                 memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
             break;
-        case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
+        case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; memset(st.sten_valid, 0, sizeof st.sten_valid); break;
         case CMD_SET_SAMPLER_POOL: st.spool = (NvnDescPool *)(uintptr_t)r->x[0]; break;
         case CMD_SET_RENDER_TARGETS: {
             const struct { uint64_t tex[8]; NvnTextureView views[8]; uint8_t has_view[8]; uint64_t depth;

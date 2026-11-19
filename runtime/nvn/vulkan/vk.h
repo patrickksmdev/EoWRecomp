@@ -38,7 +38,7 @@ typedef struct {
     VkPipelineCache pcache;
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
-    bool custom_border, divisor, host_import;
+    bool custom_border, divisor, host_import, map_placed;
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
