@@ -1510,10 +1510,8 @@ extern "C" void launcher_run(const char *root) {
                     g_confirm_delete = false;
                     page = MAIN, g_refocus = SETUP;
                 }
-                if (status.empty()) start_background_prep();
-                if (g_prep_wait && !g_bg_prep) g_prep_wait = false, play = true;
                 static bool test_busy = getenv("EOWRECOMP_LAUNCHER_SHOT") && strstr(getenv("EOWRECOMP_LAUNCHER_SHOT"), ":extracting");
-                if (busy || g_prep_wait || test_busy) {  // extracting / preparing: everything dimmed, a progress bar in front
+                if (busy || test_busy) {  // extracting: everything dimmed, a progress bar in front (input waits)
                     ImDrawList *fg = ImGui::GetForegroundDrawList();
                     ImVec2 o = ImGui::GetMainViewport()->Pos;
                     fg->AddRectFilled(o, ImVec2(o.x + ds.x, o.y + ds.y), IM_COL32(0, 0, 0, 170));
@@ -1549,6 +1547,35 @@ extern "C" void launcher_run(const char *root) {
                                     IM_COL32(150, 148, 140, 255), notes[i]);
                     }
                 }
+            }
+
+            if (status.empty()) start_background_prep();
+            if (g_prep_wait && !g_bg_prep) g_prep_wait = false, play = true;
+            if (g_prep_wait) {
+                float sc = s;
+                ImDrawList *fg = ImGui::GetForegroundDrawList();
+                ImVec2 o = ImGui::GetMainViewport()->Pos;
+                fg->AddRectFilled(o, ImVec2(o.x + ds.x, o.y + ds.y), IM_COL32(0, 0, 0, 170));
+                float f = extract_progress();
+                const char *title = "Preparing shaders";
+                float tfs = g_font_menu->FontSize * 0.75f, sfs = g_font_small->FontSize * 0.85f;
+                ImVec2 ts = g_font_menu->CalcTextSizeA(tfs, FLT_MAX, 0, title);
+                float line_h = g_font_small->CalcTextSizeA(sfs, FLT_MAX, 0, "A").y;
+                float pw = fminf(fmaxf(ds.x * 0.6f, ts.x + 96 * sc), ds.x - 32 * sc);
+                float bar_y = 36 * sc + ts.y + 30 * sc;
+                float ph = bar_y + 24 * sc + 26 * sc + line_h + 40 * sc;
+                ImVec2 a(o.x + (ds.x - pw) * 0.5f, o.y + (ds.y - ph) * 0.5f), b(a.x + pw, a.y + ph);
+                fg->AddRectFilled(a, b, IM_COL32(15, 23, 20, 250), 14 * sc);
+                fg->AddRect(a, b, IM_COL32(236, 194, 84, 140), 14 * sc, 0, 1.5f * sc);
+                fg->AddText(g_font_menu, tfs, ImVec2((a.x + b.x - ts.x) * 0.5f, a.y + 36 * sc), IM_COL32(236, 194, 84, 255), title);
+                ImVec2 ba(a.x + 48 * sc, a.y + bar_y), bb(b.x - 48 * sc, a.y + bar_y + 24 * sc);
+                fg->AddRectFilled(ba, bb, IM_COL32(255, 255, 255, 25), 12 * sc);
+                if (f > 0) fg->AddRectFilled(ba, ImVec2(ba.x + (bb.x - ba.x) * f, bb.y), IM_COL32(236, 194, 84, 255), 12 * sc);
+                uint64_t pc = g_prep_count;
+                char line[200];
+                snprintf(line, sizeof line, "Preparing shaders...   %u/%u (%d%%)", (unsigned)(pc >> 32), (unsigned)pc, (int)(f * 100));
+                ImVec2 ls = g_font_small->CalcTextSizeA(sfs, FLT_MAX, 0, line);
+                fg->AddText(g_font_small, sfs, ImVec2((a.x + b.x - ls.x) * 0.5f, bb.y + 26 * sc), IM_COL32(220, 216, 205, 255), line);
             }
 
             // status (lower left) and version (lower right) - not under the Settings / Game Files windows
