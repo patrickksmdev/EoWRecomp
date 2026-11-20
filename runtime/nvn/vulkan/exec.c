@@ -14,6 +14,7 @@
 #include "shaders.h"
 #include "vk.h"
 #include "../renderer.h"
+#include "../shader_prep.h"
 #include "../../settings.h"
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
@@ -1351,8 +1352,7 @@ static void compile_program(void *arg) {
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
-static void translate_program(void *arg) {
-    Prog *p = arg;
+static bool translate_program_now(Prog *p) {
     { static int g = -1; if (g < 0) { const char *e = getenv("EOWRECOMP_SHADER_GUARD"); g = e ? atoi(e) : 0; if (g > 0) maxwell_loop_guard = (uint32_t)g; } }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
@@ -1366,17 +1366,75 @@ static void translate_program(void *arg) {
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
         atomic_store(&p->state, 2);
-        return;
+        return false;
     }
     if (!p->fi->msl) {
         LOG("[shader] FS translate failed: %s\n", p->fi->error);
         atomic_store(&p->state, 2);
-        return;
+        return false;
     }
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
+    return true;
+}
+
+static void translate_program(void *arg) {
+    Prog *p = arg;
+    if (!translate_program_now(p)) return;
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
     run_job(compile_program, p);
+}
+
+// ================================================================== prepared objects (shader_prep.h)
+typedef struct { uint64_t key; void *val; } PrepEnt;
+static pthread_mutex_t prep_lock = PTHREAD_MUTEX_INITIALIZER;
+static PrepEnt *prep_progs, *prep_pipes, *prep_cs;
+static size_t prep_progs_cap, prep_progs_n, prep_pipes_cap, prep_pipes_n, prep_cs_cap, prep_cs_n;
+static _Atomic int prep_pending;
+
+static void *prep_get(const PrepEnt *t, size_t cap, uint64_t k) {
+    if (!cap || !k) return NULL;
+    for (size_t j = k & (cap - 1); t[j].key; j = (j + 1) & (cap - 1))
+        if (t[j].key == k) return t[j].val;
+    return NULL;
+}
+
+static void prep_put(PrepEnt **tp, size_t *capp, size_t *np, uint64_t k, void *val) {
+    if (*np * 2 >= *capp) {
+        size_t cap = *capp ? *capp * 2 : 1024;
+        PrepEnt *t = calloc(cap, sizeof *t);
+        for (size_t i = 0; i < *capp; i++)
+            if ((*tp)[i].key) {
+                size_t j = (*tp)[i].key & (cap - 1);
+                while (t[j].key) j = (j + 1) & (cap - 1);
+                t[j] = (*tp)[i];
+            }
+        free(*tp);
+        *tp = t, *capp = cap;
+    }
+    size_t j = k & (*capp - 1);
+    while ((*tp)[j].key && (*tp)[j].key != k) j = (j + 1) & (*capp - 1);
+    if (!(*tp)[j].key) (*np)++;
+    (*tp)[j] = (PrepEnt){k, val};
+}
+
+#define PREP_GET(tab, k) ({ pthread_mutex_lock(&prep_lock); void *v_ = prep_get(tab, tab##_cap, k); pthread_mutex_unlock(&prep_lock); v_; })
+#define PREP_PUT(tab, k, v) do { pthread_mutex_lock(&prep_lock); prep_put(&tab, &tab##_cap, &tab##_n, k, v); pthread_mutex_unlock(&prep_lock); } while (0)
+
+static uint64_t prog_content_key(uint64_t vh, uint64_t fh, const ShaderKey *vk, const ShaderKey *fk) {
+    uint64_t h = 0xcbf29ce484222325ull ^ vh;
+    h = (h ^ fh) * 0x9E3779B97F4A7C15ull;
+    const uint8_t *vb = (const uint8_t *)vk;
+    for (size_t i = 0; i < sizeof *vk; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
+    for (int i = 0; i < 8; i++) { h ^= fk->rt_kind[i]; h *= 0x100000001B3ull; }
+    for (int i = 0; i < 4; i++) { h ^= (fk->stencil_tex >> (i * 8)) & 0xFF; h *= 0x100000001B3ull; }
+    return h ? h : 1;
+}
+
+static uint64_t cs_content_key(uint64_t ch, const uint32_t local[3]) {
+    uint64_t h = 0xcbf29ce484222325ull ^ ch;
+    for (int i = 0; i < 3; i++) h = (h ^ local[i]) * 0x9E3779B97F4A7C15ull;
+    return h ? h : 1;
 }
 
 #define PROG_TAB 4096
@@ -1424,6 +1482,15 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
     if (prog_tab[slot].key) return prog_tab[slot].prog;
+    if (prep_progs_n) {
+        uint64_t ck = prog_content_key(shader_stage_hash(&np->stages[0]), shader_stage_hash(&np->stages[1]), vkey, fkey);
+        Prog *prep = PREP_GET(prep_progs, ck);
+        if (prep) {
+            prog_tab[slot].key = h;
+            prog_tab[slot].prog = prep;
+            return prep;
+        }
+    }
     Prog *p = calloc(1, sizeof *p);
     prog_tab[slot].key = h;
     prog_tab[slot].prog = p;
@@ -2927,6 +2994,23 @@ static CsProg *compute_program(NvnProgram *np) {
     struct CsEnt *tab = g_cs_tab;
     int n = g_cs_n;
     for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
+    uint32_t local[3];
+    for (int i = 0; i < 3; i++) {
+        local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
+        if (!local[i]) local[i] = 1;
+    }
+    uint64_t ch = shader_stage_hash(ss);
+    if (prep_cs_n && ch) {
+        CsProg *prep = PREP_GET(prep_cs, cs_content_key(ch, local));
+        if (prep) {
+            if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = prep; g_cs_n = n + 1; }
+            return prep;
+        }
+    }
+    if (shader_rec_recording() && ch) {
+        ShaderRec r = {.kind = 'C', .vs = ch, .local = {local[0], local[1], local[2]}};
+        shader_rec_note(&r);
+    }
     CsProg *cp = calloc(1, sizeof *cp);
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
@@ -3311,7 +3395,47 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
     uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
     while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
     Pipe *pp = pipe_tab[pslot].pipe;
+    if (!pp && prep_pipes_n) {
+        Pipe *prep = PREP_GET(prep_pipes, ph);
+        if (prep) {
+            pipe_tab[pslot].key = ph;
+            pipe_tab[pslot].pipe = prep;
+            pp = prep;
+        }
+    }
     if (!pp) {
+        if (shader_rec_recording()) {
+            ShaderRec rec;
+            memset(&rec, 0, sizeof rec);
+            rec.kind = 'G';
+            rec.vs = shader_stage_hash(&st.program->stages[0]);
+            rec.fs = shader_stage_hash(&st.program->stages[1]);
+            rec.flags = (nvn_window_origin() == 0 ? SR_FLIP_Y : 0) | (nvn_depth_mode() == 0 ? SR_DEPTH_MINUS_ONE : 0);
+            rec.vs_stencil = vkey.stencil_tex;
+            rec.fs_stencil = fkey.stencil_tex;
+            rec.nattrib = (uint8_t)(st.nattrib < 16 ? st.nattrib : 16);
+            memcpy(rec.attrib, st.attrib, sizeof rec.attrib[0] * rec.nattrib);
+            rec.nstream = (uint8_t)(st.nstream < 16 ? st.nstream : 16);
+            memcpy(rec.stream, st.stream, sizeof rec.stream[0] * rec.nstream);
+            rec.ncolor = (uint8_t)(st.rt.ncolor < 8 ? st.rt.ncolor : 8);
+            rec.samples = k.samples;
+            for (int i = 0; i < rec.ncolor; i++) {
+                NvnTexture *t = st.rt.color[i];
+                if (!t) continue;
+                rec.color[i] = t->format;
+                if (st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4)) rec.cview[i] = st.rt.cview[i].format;
+                rec.channel_mask |= st.channel_mask & (0xFu << (i * 4));
+                if ((k.blend_on >> i) & 1) {
+                    rec.blend_on |= (uint8_t)(1u << i);
+                    memcpy(rec.blend[i], k.blend[i], 8);
+                }
+            }
+            if (st.rt.depth) rec.depth = st.rt.depth->format;
+            rec.a2c = k.a2c;
+            rec.topo = cls;
+            rec.poly_fill = k.poly_fill;
+            shader_rec_note(&rec);
+        }
         pp = calloc(1, sizeof *pp);
         pp->k = k;
         pipe_tab[pslot].key = ph;
@@ -4643,4 +4767,151 @@ void backend_execute(uint64_t handle) {
     if (sync_submit < 0) sync_submit = getenv("EOWRECOMP_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
     else renderer_submit();
+}
+
+// ================================================================== shader preparation (shader_prep.h)
+typedef struct { void (*fn)(void *); void *arg; } PrepJob;
+static void prep_job_run(void *a) {
+    PrepJob *j = a;
+    j->fn(j->arg);
+    free(j);
+    prep_pending--;
+}
+static void prep_job(void (*fn)(void *), void *arg) {
+    PrepJob *j = malloc(sizeof *j);
+    j->fn = fn, j->arg = arg;
+    prep_pending++;
+    run_job(prep_job_run, j);
+}
+
+static _Atomic int prep_pipe_dups;
+bool renderer_prepare_begin(void) { return g_vk.dev != VK_NULL_HANDLE; }
+int renderer_prepare_pending(void) { return prep_pending; }
+void vk_pipeline_cache_save(void);
+void renderer_prepare_end(void) {
+    vk_pipeline_cache_save();
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        pthread_mutex_lock(&prep_lock);
+        size_t n = prep_pipes_n;
+        pthread_mutex_unlock(&prep_lock);
+        LOG("[vk] prepared %zu pipelines (%d records shared one)\n", n, atomic_load(&prep_pipe_dups));
+    }
+}
+
+typedef struct { Pipe *pp; ShaderRec r; } PrepPipe;
+static void prep_pipeline(void *arg) {
+    PrepPipe *a = arg;
+    Prog *pr = a->pp->k.prog;
+    while (atomic_load(&pr->state) == 0) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }
+    if (atomic_load(&pr->state) != 1) { atomic_store(&a->pp->state, 2); free(a->pp); free(a); return; }
+    const ShaderRec *r = &a->r;
+    PipeKey *k = &a->pp->k;
+    k->ncolor = r->ncolor;
+    k->samples = r->samples ? r->samples : 1;
+    for (uint32_t i = 0; i < k->ncolor && i < 8; i++) {
+        if (!r->color[i]) continue;
+        VkFormat b = vk_format(r->color[i]);
+        k->color[i] = r->cview[i] && vk_format(r->color[i]) == b ? vk_format(r->cview[i]) : b;
+        k->write_mask[i] = ((pr->fi->out_mask >> (i * 4)) & 0xF) ? (r->channel_mask >> (i * 4)) & 0xF : 0;
+        if ((r->blend_on >> i) & 1) {
+            k->blend_on |= (uint8_t)(1u << i);
+            memcpy(k->blend[i], r->blend[i], 8);
+        }
+    }
+    while (k->ncolor && !r->color[k->ncolor - 1]) k->ncolor--;
+    if (r->depth && renderer_format_is_depth(r->depth)) {
+        VkFormat b = vk_format(r->depth);
+        k->depth = b;
+        if (renderer_format_has_stencil(r->depth)) k->stencil = b;
+    }
+    for (int i = 0; i < 32; i++) {
+        if (!(pr->vi->attr_mask & (1u << i))) continue;
+        k->attr_mask |= 1u << i;
+        uint32_t a_val = i < r->nattrib ? r->attrib[i] : 0x2E;
+        uint32_t fmt = a_val & 0xFF, stream = (a_val >> 8) & 0x1F, off = a_val >> 13;
+        if (i >= r->nattrib || fmt == 0 || stream >= 16) {
+            k->attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+            k->attr_bind[i] = ZERO_BINDING;
+            k->used_streams |= 1u << ZERO_BINDING;
+            continue;
+        }
+        k->attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
+        k->attr_off[i] = off;
+        k->attr_bind[i] = stream;
+        k->used_streams |= 1u << stream;
+    }
+    for (int s = 0; s < 16; s++) {
+        if (!(k->used_streams & (1u << s))) continue;
+        k->stride[s] = s < r->nstream ? r->stream[s][0] : 0;
+        k->divisor[s] = s < r->nstream && k->stride[s] ? r->stream[s][1] : 0;
+        if (k->divisor[s] > 1 && !g_vk.divisor) k->divisor[s] = 1;
+    }
+    k->a2c = r->a2c;
+    k->topo_class = r->topo;
+    k->poly_fill = r->poly_fill;
+    uint64_t ph = hash_words(0xcbf29ce484222325ull, k, sizeof *k);
+    if (!ph) ph = 1;
+    pthread_mutex_lock(&prep_lock);
+    bool dup = prep_get(prep_pipes, prep_pipes_cap, ph) != NULL;
+    if (!dup) prep_put(&prep_pipes, &prep_pipes_cap, &prep_pipes_n, ph, a->pp);
+    pthread_mutex_unlock(&prep_lock);
+    if (dup) { atomic_fetch_add(&prep_pipe_dups, 1); free(a->pp); free(a); return; }
+    build_pipeline(a->pp);
+    free(a);
+}
+
+bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlob *fsb) {
+    if (r->kind == 'C') {
+        uint64_t ck = cs_content_key(r->vs, r->local);
+        if (PREP_GET(prep_cs, ck)) return true;
+        CsProg *cp = calloc(1, sizeof *cp);
+        cp->p.code[0] = r->vs;
+        memcpy(cp->local, r->local, sizeof cp->local);
+        maxwell_gmem_base = HEAP_BASE;
+        maxwell_gmem_size = HEAP_MAX;
+        ShaderKey k = {0};
+        k.glsl = 1;
+        pthread_mutex_lock(&translate_lock);
+        cp->si = maxwell_translate(vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000, STAGE_COMPUTE, &k);
+        pthread_mutex_unlock(&translate_lock);
+        cp->p.vi = cp->si;
+        if (!cp->si->msl) { free(cp); return false; }
+        PREP_PUT(prep_cs, ck, cp);
+        prep_job(build_compute, cp);
+        return true;
+    }
+    ShaderKey vkey = {0}, fkey = {0};
+    vkey.glsl = fkey.glsl = 1;
+    vkey.flip_y = fkey.flip_y = (r->flags & SR_FLIP_Y) != 0;
+    vkey.depth_minus_one = (r->flags & SR_DEPTH_MINUS_ONE) != 0;
+    vkey.flip_x = fkey.flip_x = (r->flags & SR_FLIP_X) != 0;
+    vkey.stencil_tex = r->vs_stencil;
+    fkey.stencil_tex = r->fs_stencil;
+    for (int i = 0; i < r->nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(r->attrib[i] & 0xFF);
+    for (int i = 0; i < r->ncolor && i < 8; i++) if (r->color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(r->color[i]);
+    uint64_t ck = prog_content_key(r->vs, r->fs, &vkey, &fkey);
+    Prog *p = PREP_GET(prep_progs, ck);
+    if (!p) {
+        p = calloc(1, sizeof *p);
+        p->code[0] = (uintptr_t)vsb->code;
+        p->code[1] = (uintptr_t)fsb->code;
+        p->cmax[0] = vsb->const_offset ? vsb->const_offset : 0x10000;
+        p->cmax[1] = fsb->const_offset ? fsb->const_offset : 0x10000;
+        p->vkey = vkey;
+        p->fkey = fkey;
+        bool ok = translate_program_now(p);
+        p->code[0] = p->code[1] = 0;
+        PREP_PUT(prep_progs, ck, p);
+        if (!ok) return false;
+        prep_job(compile_program, p);
+    }
+    if (atomic_load(&p->state) == 2) return false;
+    PrepPipe *a = calloc(1, sizeof *a);
+    a->pp = calloc(1, sizeof *a->pp);
+    a->pp->k.prog = p;
+    a->r = *r;
+    prep_job(prep_pipeline, a);
+    return true;
 }

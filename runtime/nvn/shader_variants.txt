@@ -1,0 +1,2 @@
+# EoWRecomp shader variant records (no shader code: one-way hashes + NVN state only).
+# Record with: EOWRECOMP_RECORD_KEYS=runtime/nvn/shader_variants.txt

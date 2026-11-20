@@ -48,6 +48,7 @@ extern "C" {
 #include "romfs_build.h"
 #include "settings.h"
 #include "input_bind.h"
+#include "nvn/shader_prep.h"
 void controls_bindings_draw(float scale);  // ui/controls_ui.mm
 void ui_window_init(void);
 SDL_Window *ui_window(void);
@@ -92,6 +93,7 @@ static const uint8_t BUILD_ID[8] = {0xa5, 0x81, 0x40, 0x6b, 0xc9, 0x85, 0x86, 0x
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): alpha_<n> while the game isn't playable, beta_<n> until 1.0, then v<major>.<minor>.<patch>.
 #define EOWRECOMP_VERSION "v0.4.0"
+extern "C" const char *eowrecomp_version(void) { return EOWRECOMP_VERSION; }
 
 // ------------------------------------------------------------------ update check
 // The start screen asks GitHub for the project's releases once per launch (a background curl, which macOS and
@@ -306,7 +308,39 @@ static void build_progress(double f, const char *step) {
     static const char *last;
     if (step != last) last = step, set_job(step);
 }
+// Shader preparation, after the game files are ready (runtime/nvn/shader_prep.h)
+static std::atomic<float> g_prep_frac{-1};  // -1: not preparing
+static volatile int g_prep_skip;
+static std::atomic<uint64_t> g_prep_count{0};
+static void prep_progress(int done, int total) {
+    g_prep_count = (uint64_t)(uint32_t)done << 32 | (uint32_t)total;
+    g_prep_frac = total ? (float)done / (float)total : 0.0f;
+}
+static void prepare_shaders(bool background = false) {
+    g_prep_skip = 0, g_prep_count = 0, g_prep_frac = 0;
+    if (!background) set_job("Preparing shaders...");
+    shader_prep_run((g_root + "/romfs").c_str(), prep_progress, &g_prep_skip);
+    g_prep_frac = -1;
+}
+static std::atomic<bool> g_bg_prep{false};
+static bool g_prep_wait;
+static void start_background_prep(void) {
+    static bool started;
+    if (started) return;
+    started = true;
+    g_bg_prep = true;
+    pthread_t th;
+    pthread_create(&th, NULL, [](void *) -> void * { prepare_shaders(true); g_bg_prep = false; return NULL; }, NULL);
+    pthread_detach(th);
+}
+static void stop_background_prep(void) {
+    if (!g_bg_prep) return;
+    g_prep_skip = 1;
+    while (g_bg_prep) SDL_Delay(5);
+}
+
 static float extract_progress(void) {
+    if (float p = g_prep_frac; p >= 0) return p > 1 ? 1 : p;
     unsigned long long t = g_total, d = g_done;
     float b = g_build_frac, f = b >= 0 ? (g_copy_skipped ? b : 0.1f + 0.9f * b) : t ? 0.1f * (float)((double)d / (double)t) : 0;
     return f < 0 ? 0 : f > 0.99f ? 0.99f : f;
@@ -439,7 +473,10 @@ static void *extract_thread(void *) {
 check:
     {
         std::string why = check_game_files(g_root);
-        if (why.empty()) set_job("Game files ready.");
+        if (why.empty()) {
+            prepare_shaders();
+            set_job("Game files ready.");
+        }
         else set_failure(why.find("version") != std::string::npos ? FAIL_VERSION : FAIL_MISSING);
     }
 done:
@@ -1473,15 +1510,17 @@ extern "C" void launcher_run(const char *root) {
                     g_confirm_delete = false;
                     page = MAIN, g_refocus = SETUP;
                 }
+                if (status.empty()) start_background_prep();
+                if (g_prep_wait && !g_bg_prep) g_prep_wait = false, play = true;
                 static bool test_busy = getenv("EOWRECOMP_LAUNCHER_SHOT") && strstr(getenv("EOWRECOMP_LAUNCHER_SHOT"), ":extracting");
-                if (busy || test_busy) {  // extracting: everything dimmed, a progress bar in front (input waits)
+                if (busy || g_prep_wait || test_busy) {  // extracting / preparing: everything dimmed, a progress bar in front
                     ImDrawList *fg = ImGui::GetForegroundDrawList();
                     ImVec2 o = ImGui::GetMainViewport()->Pos;
                     fg->AddRectFilled(o, ImVec2(o.x + ds.x, o.y + ds.y), IM_COL32(0, 0, 0, 170));
                     float f = test_busy ? 0.42f : extract_progress();
-                    // (while the game code is built: what's happening, on whose files - runtime/gamebuild.c)
-                    bool recompiling = g_build_frac >= 0;
-                    const char *title = recompiling ? "Recompiling the game" : "Setting up the game files";
+                    bool preparing = g_prep_frac >= 0;
+                    bool recompiling = !preparing && g_build_frac >= 0;
+                    const char *title = preparing ? "Preparing shaders" : recompiling ? "Recompiling the game" : "Setting up the game files";
                     static const char *const notes[] = {"This only needs to be done once and may take a while."};
                     int nnotes = recompiling ? 1 : 0;
                     float tfs = g_font_menu->FontSize * 0.75f, sfs = g_font_small->FontSize * 0.85f;
@@ -1613,7 +1652,12 @@ extern "C" void launcher_run(const char *root) {
             if (shot) exit(0);
 #endif
         }
+        if (play && g_bg_prep) {
+            g_prep_wait = true;
+            play = false;
+        }
     }
+    stop_background_prep();
     // play: hand the window to the game
     settings_save();
 #ifdef EOW_METAL
