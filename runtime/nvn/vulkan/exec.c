@@ -1821,9 +1821,15 @@ typedef struct { NvnTexture *key; TexBackend copy; } Snap;
 static Snap snaps[16];
 static int nsnaps;
 
+static uint64_t stage_tex_handle(int stage, const ShaderTexture *st_) {
+    int off = (int)st_->handle_offset;
+    if (off >= 0x20 && off < 0x120) return st.tex[stage][(off - 0x20) / 8];
+    if (off >= 0x120 && off < 0x160) return st.img[stage][(off - 0x120) / 8];
+    return 0;
+}
+
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
-    int slot = ((int)st_->handle_offset - 0x20) / 8;
-    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint64_t h = stage_tex_handle(stage, st_);
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
     return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
@@ -2810,8 +2816,7 @@ void vk_exec_reset(void) {
 
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
-    int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
-    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint64_t h = stage_tex_handle(stage, st_);
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
     bool stencil_key = false;  // the shader declared this binding a usampler2D (tex_stencil in translate.c)
@@ -2947,7 +2952,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
             bi[n] = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
-            for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
+            for (int t = 0; t < si->ntex && t < 64; t++) {
+                float sx = stage == 5 ? 1.0f : tex_sc[sg][t][0];
+                float sy = stage == 5 ? 1.0f : tex_sc[sg][t][1];
+                rs[1 + t][0] = sx > 0.0f ? sx : 1.0f;
+                rs[1 + t][1] = sy > 0.0f ? sy : 1.0f;
+            }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
         } else {
             float zero[8] = {0};
