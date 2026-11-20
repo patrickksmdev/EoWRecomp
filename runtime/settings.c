@@ -24,7 +24,7 @@ Settings g_settings = {
     .show_fps = false,
     .vsync = true,
     .fps_limit = 60,
-    .sync_shaders = SHADER_SMART,
+    .sync_shaders = SHADER_SYNC,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 };
 
