@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="status" src="https://img.shields.io/badge/status-v0.4.0-orange">
+  <img alt="status" src="https://img.shields.io/badge/status-v0.5.0-orange">
   <img alt="platform" src="https://img.shields.io/badge/target-Linux%20x86--64-blue">
   <img alt="graphics" src="https://img.shields.io/badge/graphics-Vulkan-red">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -28,16 +28,18 @@ EoWRecomp translates the game's ARM64 machine code into C ahead of time and reco
 > [!WARNING]
 > **No game files are included.** You must provide your own legally obtained copy of *The Legend of Zelda: Echoes of Wisdom* v1.0.0 (title ID `01008CF01BAAC000`) and your own `prod.keys`. The repository does not provide game files, keys, or instructions for obtaining them.
 
-## Linux progress (`v0.4.0`)
+## Linux progress (`v0.5.0`)
 
-- **Tested playable through the 2nd dungeon (Gerudo Desert):** intro, Hyrule Castle Town, Suthorn Village, Still World (Rifts), 2D sections, first dungeon, and Gerudo Desert dungeon with audio, working save/load, and zero freezes.
+- **Most of the overworld explored smoothly + playable through the 2nd dungeon (Gerudo Desert):** intro, Hyrule Castle Town, Suthorn Village, Still World (Rifts), 2D sections, first dungeon, and Gerudo Desert dungeon with audio, working save/load, and zero freezes.
+- **Ahead-of-time shader preparation (`shader_prep`):** pre-translates and compiles 1,173+ known shader variants from your own game files on the start screen (plus automatic `cache/shader_seen.txt` for newly encountered variants), with `Sync` shader mode enabled by default for zero pop-in.
+- **Dynamic cubemap / IBL lighting fix:** fixed image-slot `TXQ` lookups (`stage_tex_handle()`) and compute `rscale` in `runtime/nvn/vulkan/exec.c`, restoring ambient lighting and metallic reflections across zone transitions (e.g., Hyrule Castle courtyard).
 - **Placed-memory guest heap (`VK_EXT_map_memory_placed`) & CPU draw optimizations:** maps host-cached GTT memory directly at `HEAP_BASE` (eliminating per-submit `amdgpu` userptr overhead on Linux RADV, `~50x` faster `vkQueueSubmit2`), plus cached `stencil_slots()` masks, gated debug checks in `draw_()`, and `gw_hit()` bounding-box fast-reject + completed-sequence cache (**~66 FPS → 91–116 FPS** in open areas; **46–50 FPS → 99.8–120 FPS** in heavy draw areas on RX 7600).
 - **Rift / Void rendering fix:** submission-tracked GPU-written buffer lifetimes (`gw_tab`, ported from `tcsenpai/EoWRecomp`) fix visual glitches after exiting Rift areas without address-specific workarounds.
 - **Kernel condvar & watchdog fixes:** fixed `svc_wait_process_wide_key()` lost wake-up, `block_current()` `TimedWait` vs `Signal` race, atomic CAS arbiter updates in `runtime/kernel.c`, and duplicate Linux watchdog registration (**0 `unstick`** in 272 s+ sessions).
 - **GPU-side indirect draws (`vkCmdDrawIndirect` / `vkCmdDrawIndexedIndirect`):** eliminated mid-frame CPU flush stalls and added live tracking for GPU-written constant buffers.
 - **Smart shader compilation & pre-warming:** pre-warms shaders on `nvnProgramSetShaders` using the active window origin/depth mode and waits synchronously on critical fullscreen/compute passes (`Smart` / `Sync` / `Async` selectable in the `F1` menu), eliminating lighting/scene flicker.
 - **VSync & FPS limit:** toggle VSync and cap FPS (`30` / `60` / `120` / `Unlimited`) from the `F1` → **Display** menu.
-- **XCI extraction & AppImage:** HFS0 `.xci` support in `tools/nca_extract.py` and standalone x86-64 AppImages (`build/dist/EoWRecomp-v0.4.0-linux-x86_64.AppImage`).
+- **XCI extraction & AppImage:** HFS0 `.xci` support in `tools/nca_extract.py` and standalone x86-64 AppImages (`build/dist/EoWRecomp-v0.5.0-linux-x86_64.AppImage`).
 
 ### Known issues
 - **Map screen >120 FPS:** keep `FPS limit` at `60` or `120` (running at `144+` fps currently inverts the analog stick on the map screen).
@@ -48,8 +50,8 @@ EoWRecomp translates the game's ARM64 machine code into C ahead of time and reco
 ### AppImage (recommended)
 Download the latest AppImage from [Releases](https://github.com/patrickksmdev/EoWRecomp/releases):
 ```bash
-chmod +x EoWRecomp-v0.4.0-linux-x86_64.AppImage
-./EoWRecomp-v0.4.0-linux-x86_64.AppImage
+chmod +x EoWRecomp-v0.5.0-linux-x86_64.AppImage
+./EoWRecomp-v0.5.0-linux-x86_64.AppImage
 ```
 On first launch, select the folder containing your `.nsp`/`.xci` and `prod.keys`. The launcher will extract ExeFS and compile `eowgame.so` locally.
 

@@ -1,6 +1,25 @@
 # Status
 
-Atualizado: 2026-11-19 (sessão 7: Linux x86-64 / RX 7600 RADV — correção de piscadas de shader, lost wake-up / self-deadlock no `kernel.c`, watchdog duplicado no Linux e fast-reject em `gw_hit()`).
+Atualizado: 2026-11-20 (sessão 8: Linux x86-64 / RX 7600 RADV — `v0.5.0`: pré-compilação de shaders no launcher (`shader_prep`), padrão `SHADER_SYNC`, suporte ao RecompLauncher e correção da iluminação/IBL dinâmica de cubemap).
+
+## Sessão 8 (2026-11-20): Linux x86-64 / AMD RX 7600 (RADV) — Pré-compilação de shaders (`shader_prep`), RecompLauncher e cubemap dinâmico (`v0.5.0`)
+
+### Adicionado e corrigido nesta sessão
+- **Pré-compilação antecipada de shaders (`a34e9885`, `a2b9f7b4`):**
+  - Portado o sistema `shader_prep` / `shader_seen` de `LASRecomp` para `runtime/nvn/shader_prep.c`, `runtime/nvn/shader_seen.c` e `runtime/nvn/shader_prep.h` (adaptado para `ShaderKey.stencil_tex` e leitura direta de `.xci`/`.nsp` via `nx_romfs_open`).
+  - Integrado na tela inicial (`runtime/ui/launcher.mm`) com pré-aquecimento em background e barra `"Preparing shaders"` ao clicar em `PLAY` caso ainda esteja em andamento.
+  - Populado `runtime/nvn/shader_variants.txt` com **1.173 variantes** reais gravadas em gameplay (apenas hashes one-way e estado NVN, sem código proprietário).
+- **Modo de shader padrão (`1182032c`):** `sync_shaders` em `runtime/settings.c` alterado para `SHADER_SYNC` por padrão, evitando pop-in visual em áreas inéditas enquanto `shader_prep` + `shader_seen.txt` mantêm o gameplay fluido.
+- **Correção da iluminação ambiente / cubemap dinâmico (`e5799572`):**
+  - Ao caminhar em áreas como a escadaria do Castelo de Hyrule, a luz ambiente e os reflexos metálicos (ex.: capacetes dos guardas) caíam para preto ao trocar do cubemap estático (`0x7f90f0325ab0`, BC6H) para o cubemap dinâmico (`0x7f913d7b1a00`, `64x64 f0x25 lv 7`) gerado pelo compute shader `72a4723000`.
+  - Causa raiz: `texture_info()` e `shader_texture_object()` em `runtime/nvn/vulkan/exec.c` só consultavam `st.tex` (`0x20..0x118`) e retornavam dummy `1x1` para o `TXQ` (`tsize0`) no slot de imagem `c[2][0x120]` (`st.img[5][0]`), fazendo o compute shader sair sem gravar os pixels do cubemap; além disso, `stage_set()` não preenchia `rscale` para compute (`stage == 5`).
+  - Adicionado `stage_tex_handle()` (cobrindo `st.tex` e `st.img`) e `rscale = 1.0f` para compute. Verificado in-game na escadaria do Castelo de Hyrule com iluminação e reflexos restaurados.
+- **Integração com RecompLauncher (`23e79f7a`):** adicionado `recomplauncher.json` ao repositório e ao `.github/workflows/release.yml` para publicação automática nos assets das releases.
+
+### Próximo passo
+1. Continuar a progressão após a 2ª dungeon (Gerudo Desert) verificando novos shaders/SVCs/serviços IPC e ampliando `shader_variants.txt`.
+2. Investigar os 2 opcodes de fragment shader sem tradução que aparecem no boot (`df02022020770600` e `c8380226aff70400`).
+3. Validar em uma máquina Windows o pacote gerado pelo CI (`release.yml`).
 
 ## Sessão 7 (2026-11-19): Linux x86-64 / AMD RX 7600 (RADV) — Shaders, `unstick` no kernel e otimização de CPU (`gw_hit`)
 
