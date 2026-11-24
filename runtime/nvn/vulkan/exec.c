@@ -3348,6 +3348,19 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
             }
         }
     }
+    {   // EOWRECOMP_SKIP_COUNT=n1,n2,...: drop draws with these index / vertex counts (bisect which draw makes what:
+        // the counts are in the EOWRECOMP_DEBUG_FRAME log; a fragment shader is often shared by many objects)
+        static uint64_t sc[8];
+        static int nsc = -1;
+        if (nsc < 0) {
+            nsc = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_COUNT"); p && *p && nsc < 8;) {
+                sc[nsc++] = strtoull(p, (char **)&p, 10);
+                while (*p == ',') p++;
+            }
+        }
+        for (int i = 0; i < nsc; i++) if (r->x[2] == sc[i]) { SKIP(SKIP_LIST); return true; }
+    }
     if (g_debug_frame && !ind_buf) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
     gw_before_cbufs(pr);
@@ -3823,6 +3836,25 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             LOG(" | words");
             for (int k = 0; k < 8; k++) LOG(" %08x", ((const uint32_t *)v)[k]);
             LOG("\n");
+        }
+        {   // instancing: base instance, and the first 64 bytes of vertex storage buffer 0 at it (per-instance data)
+            uint32_t bi = (uint32_t)(indexed ? r->x[5] : r->x[3]);
+            const Range *sb = &st.sbuf[0][0];
+            LOG("[draw]   base instance %u, vertex sbuf0 %llx size %llu", bi, (unsigned long long)sb->addr, (unsigned long long)sb->size);
+            for (int k = 0; sb->addr && k < 12 && (uint64_t)bi * 64 + k * 4 + 4 <= sb->size; k++)
+                LOG(" %.4g", ((const float *)(uintptr_t)sb->addr)[bi * 16 + k]);
+            LOG("\n");
+        }
+        if (indexed && r->x[1] >= 1 && r->x[1] <= 2) {  // indices: their range against stream 0's vertices
+            uint32_t hi = 0, n = (uint32_t)r->x[2];
+            const void *ix = (const void *)(uintptr_t)r->x[3];
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t v = r->x[1] == 1 ? ((const uint16_t *)ix)[i] : ((const uint32_t *)ix)[i];
+                if (v > hi && !(st.prim_restart && v == st.restart_index)) hi = v;
+            }
+            uint32_t stride0 = st.nstream ? st.stream[0][0] : 0;
+            LOG("[draw]   indices %u-bit max %u base vertex %d, stream 0 holds %llu vertices\n", r->x[1] == 1 ? 16 : 32, hi,
+                (int)r->x[4], (unsigned long long)(stride0 ? st.vbuf[0].size / stride0 : 0));
         }
         // Each used vertex attribute: NVN format, stream, offset and whether the shader sees it as float / int / uint.
         // The skinning bone index (a7) is the one to check: it must be a uint format, read with the right component count.
