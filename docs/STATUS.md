@@ -1,6 +1,66 @@
 # Status
 
-Atualizado: 2026-11-20 (sessão 8: Linux x86-64 / RX 7600 RADV — `v0.5.0`: pré-compilação de shaders no launcher (`shader_prep`), padrão `SHADER_SYNC`, suporte ao RecompLauncher e correção da iluminação/IBL dinâmica de cubemap).
+Atualizado: 2026-11-24 (sessão 9: Windows / RTX 3070 — ver abaixo). Antes: 2026-11-20 (sessão 8: Linux x86-64 / RX 7600 RADV — `v0.5.0`: pré-compilação de shaders no launcher (`shader_prep`), padrão `SHADER_SYNC`, suporte ao RecompLauncher e correção da iluminação/IBL dinâmica de cubemap).
+
+## Sessão 9 (2026-11-24): Windows 11 / RTX 3070 Laptop (NVIDIA, Vulkan 1.4) — este tree no Windows
+
+Primeiro teste deste tree no Windows com NVIDIA (o usuário shkankin; até aqui o Windows só tinha sido testado com
+RX 580). Build cruzado no WSL (`tools/windows/build.sh`, zig cc), janela 1280x720.
+
+### Trazido do fork Windows (branch `win-on-patrick`)
+- `windows: POSIX rename` (substitui o destino: o `rename` da CRT falha com EEXIST, então `romfs.src` numa 2ª configuração e `eowgame.dll`
+  num rebuild falhavam).
+- **Import library no link da `eowgame.dll`** (`Makefile`): o zig nomeia a import library da DLL pelo 1º arquivo de
+  entrada e ignora `--out-implib`; com `$(IMPLIB)` antes dos objetos, `eowrecomp.lib` era sobrescrita e o 2º link
+  sempre falhava (`rt_dispatch` indefinido). A lib agora vai depois dos objetos; dois relinks forçados mantêm o md5.
+- `nca_extract.py --romfs-src` (RomFS lido no lugar, de dentro do XCI/NSP).
+- Depuração: `EOWRECOMP_VS_DUMP` + `tools/vsemu.py` (roda o GLSL do vertex shader na CPU sobre os vértices de uma
+  draw), `EOWRECOMP_DUMP_SHADERS` (compute que não traduz), linhas de instância/índices no log `[draw]`,
+  `EOWRECOMP_SKIP_COUNT` e `EOWRECOMP_SKIP_CS` com lista.
+- O resto do fork já estava aqui com outro nome (BRX, LDC.64, RGB565, tabelas de salto, autosave do cache, etc.).
+
+### Visto funcionando (RTX 3070, scripts com `EOWRECOMP_INPUT` sobre cópia dos saves do usuário)
+- Boot, filme de abertura, lista de saves (6 arquivos lidos), carregar autosave.
+- Luta com Ganon (Link): escada, cutscene, ~80 s de luta, 60 fps, nenhuma draw pulada (o script não vence a luta).
+- **A fenda/portal no chão** (Suthorn, depois de libertar Zelda) aparece certa (vazio escuro com destroços); no fork
+  Windows antigo só o contorno aparecia.
+- Ritmo: 60,0 fps estáveis (120 quadros a cada 2 s). O limitador de FPS deste tree (`fps_limit`, padrão 60) evita o
+  bug de velocidade 2x que o fork Windows corrigiu com uma fila de apresentação (54971fd); fica o deste tree.
+- `VK_EXT_map_memory_placed` não é usado no NVIDIA/Windows: o heap entra por `gmem_import` (log "guest heap
+  imported ... 3220 MB"), o mesmo caminho do fork antigo.
+
+### Corrigido: perda do dispositivo no NVIDIA depois da capa de Zelda (`6ba840d`)
+- Sintoma: logo depois de Zelda pegar a capa do espadachim (Ruínas de Suthorn, antes do título), `VK_ERROR_DEVICE_LOST`
+  com page fault numa leitura (`address read invalid 0x42c8d4000`..`0x42dd59000`), em ~1 de cada 4-6 execuções; com o
+  `EOWRECOMP_VK_CHECKPOINTS` ligado, 8 de 16. O fork Windows antigo não caía ali (mas desenhava a fenda errada).
+- Achado com `VK_NV_device_diagnostic_checkpoints` (novo `EOWRECOMP_VK_CHECKPOINTS=1`, com `EOWRECOMP_VK_DEVLOST_TRACE=1`):
+  todas as falhas param na draw da fenda (vs 72a46f4000 / fs 72a46f5000, 1152 índices), que amostra o stencil do próprio
+  depth-stencil via o snapshot de feedback.
+- Causa: `resolve_feedback` reaproveitava o snapshot de uma textura sem conferir se ela mudou. O jogo reinicializa os
+  objetos de textura no lugar (resolução dinâmica 896x504..1067x600; um objeto foi alvo de cor R11G11B10 antes de virar
+  D24S8), e as views eram feitas com o formato/aspecto atuais: views de profundidade/stencil sobre uma imagem de cor.
+  Agora o snapshot só é reusado se tamanho, formato e aspecto batem; senão é copiado de novo (log
+  `feedback snapshot ... is stale`).
+- Medido (rota com script da capa ao título, RTX 3070): 8/16 perdas antes, 0/16 depois; `EOWRECOMP_NO_SNAPSHOT_REUSE=1`
+  também 0/12. Build final sem opções de depuração: 8/8 sem perda, 3 min passando a fenda a 60 fps, boot com save vazio
+  e a luta com Ganon (até o quadro 8520, 60 fps) sem erro.
+- Descartados no caminho (cada um com 6-12 execuções, todos ainda caíam): `EOWRECOMP_VK_LIVE_UBO=0`, `EOWRECOMP_VK_GMEM_FAST=0`,
+  pular o compute SUST, limitar os acessos `gmem_` ao tamanho importado, `EOWRECOMP_SYNC_SUBMIT=1`. Pular os computes
+  de culling 72a4711000/15000 pareceu resolver (0/16), mas eles nem eram despachados nessa rota: foi sorte; atenção a isso
+  ao bisectar com `EOWRECOMP_SKIP_CS` (conferir "skip list" no log).
+
+### Também neste tree
+- `gmem_import`: ao crescer o heap, a importação antiga era destruída depois de esperar só o trabalho já submetido,
+  mas o command buffer em gravação pode já ter descritores dela; agora é liberada quando a submissão seguinte termina
+  (`4ade00d`). Visto lendo o código; nas execuções medidas o heap foi importado uma vez só.
+- `tools/test_vmnmx.c` não compilava com clang/zig (`int` de ponteiro).
+- `tools/test_translate.sh` usa `REF=652e234`, que não está neste repositório (nem no upstream).
+
+### Próximo passo / o que o usuário deve testar
+1. Jogar com este build (pasta `C:\EoW\run-patrick`): a cena da capa e o título, e passar da fenda.
+2. Vencer a luta com Ganon (o script não vence).
+3. Áudio ainda não verificável (o laptop não tem saída de som).
+4. O log mostra a resolução dinâmica do jogo variando (896x504..1067x600 escalados); ver se causa outros efeitos.
 
 ## Sessão 8 (2026-11-20): Linux x86-64 / AMD RX 7600 (RADV) — Pré-compilação de shaders (`shader_prep`), RecompLauncher e cubemap dinâmico (`v0.5.0`)
 
