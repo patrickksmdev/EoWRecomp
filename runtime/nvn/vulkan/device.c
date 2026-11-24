@@ -170,6 +170,9 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
+    // EOWRECOMP_VK_CHECKPOINTS=1 (NVIDIA): markers in the command buffers, read back on device loss (exec.c dl_*)
+    g_vk.checkpoints = getenv("EOWRECOMP_VK_CHECKPOINTS") && has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    if (g_vk.checkpoints) ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
 
     // features the backend relies on (all present on current desktop drivers)
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT have_placed = {

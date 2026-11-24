@@ -362,9 +362,11 @@ static VkQueryPool gp_qp;
 static int gp_n;
 static char gp_label[512][112];
 static uint32_t gp_draws[512];
-// EOWRECOMP_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with EOWRECOMP_SYNC_SUBMIT=1 the
-// dump ends with the command list that faulted).
-static char dl_ring[64][128];
+// EOWRECOMP_VK_DEVLOST_TRACE=1: the last 4096 GPU operations (passes, draws with their programs, dispatches, copies),
+// dumped on device loss (with EOWRECOMP_SYNC_SUBMIT=1 the dump ends with the command list that faulted; =2 also makes
+// each pass its own submission, so that list is one pass).
+#define DL_RING 4096
+static char dl_ring[DL_RING][128];
 static unsigned dl_n;
 static int dl_on = -1;
 static void dl_note(const char *fmt, ...) {
@@ -372,14 +374,35 @@ static void dl_note(const char *fmt, ...) {
     if (!dl_on) return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(dl_ring[dl_n++ & 63], sizeof dl_ring[0], fmt, ap);
+    vsnprintf(dl_ring[dl_n++ % DL_RING], sizeof dl_ring[0], fmt, ap);
     va_end(ap);
 }
 void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv) { dl_note("  upload %p %ux%u lv%u", img, w, h, lv); }
+// EOWRECOMP_VK_CHECKPOINTS=1 (with the trace, NVIDIA's VK_NV_device_diagnostic_checkpoints): a marker after each traced
+// draw / dispatch / pass naming its ring entry; on device loss the driver says how far each pipeline stage got.
+static void dl_checkpoint(VkCommandBuffer cb) {
+    static PFN_vkCmdSetCheckpointNV set;
+    if (!dl_on || !g_vk.checkpoints || !cb) return;
+    if (!set) set = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetCheckpointNV");
+    if (set) set(cb, (const void *)(uintptr_t)(dl_n - 1));
+}
 void vk_devlost_dump(void) {
     if (!dl_on) return;
     LOG("[vk] last GPU operations before the device loss (oldest first):\n");
-    for (unsigned i = dl_n > 64 ? dl_n - 64 : 0; i < dl_n; i++) LOG("[vk]   %s\n", dl_ring[i & 63]);
+    for (unsigned i = dl_n > DL_RING ? dl_n - DL_RING : 0; i < dl_n; i++) LOG("[vk]   #%u %s\n", i, dl_ring[i % DL_RING]);
+    PFN_vkGetQueueCheckpointDataNV get =
+        g_vk.checkpoints ? (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(g_vk.dev, "vkGetQueueCheckpointDataNV") : NULL;
+    if (!get) return;
+    uint32_t n = 0;
+    get(g_vk.queue, &n, NULL);
+    VkCheckpointDataNV cd[16];
+    for (uint32_t i = 0; i < 16; i++) cd[i] = (VkCheckpointDataNV){.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV};
+    if (n > 16) n = 16;
+    get(g_vk.queue, &n, cd);
+    for (uint32_t i = 0; i < n; i++) {
+        unsigned k = (unsigned)(uintptr_t)cd[i].pCheckpointMarker;
+        LOG("[vk] checkpoint: stage %#x reached #%u: %s\n", (unsigned)cd[i].stage, k, k < dl_n && dl_n - k <= DL_RING ? dl_ring[k % DL_RING] : "?");
+    }
 }
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     if (!g_gpuprof_frame || gp_n >= 511) return;
@@ -1036,6 +1059,7 @@ static void begin_pass(void) {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
                 (void *)st.rt.depth);
+        dl_checkpoint(cb);
     }
     if (g_gpuprof_frame) {
         NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
@@ -3186,6 +3210,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
             (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
+    dl_checkpoint(cb);
     nfeedback = 0;
     if (ct_on()) {
         LOG("[ct] dispatch cs %llx %ux%ux%u | tex", (unsigned long long)st.program->stages[5].code_addr, gx, gy, gz);
@@ -3793,6 +3818,10 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
     float pvp[4] = {vp[0] * vp_sx + vp_ox, vp[1] * vp_sy + vp_oy, vp[2] * vp_sx, vp[3] * vp_sy};
     bool probing = probe_begin(cb, st.program->stages[0].code_addr, st.program->stages[1].code_addr, (uint32_t)(use_index ? icount : count), inst, use_index, pvp);
+    dl_note("  draw %s%s vs %llx fs %llx count %u inst %u", indexed ? "e" : "a", ind_buf != VK_NULL_HANDLE ? " indirect" : "",
+            (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
+            (unsigned)(use_index ? icount : count), (unsigned)inst);
+    dl_checkpoint(cb);
     if (ind_buf != VK_NULL_HANDLE) {
         if (!indexed) vkCmdDrawIndirect(cb, ind_buf, ind_off, 1, 0);
         else vkCmdDrawIndexedIndirect(cb, ind_buf, ind_off, 1, 0);
