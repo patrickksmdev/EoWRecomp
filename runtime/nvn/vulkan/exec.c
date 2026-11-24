@@ -3122,10 +3122,17 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         while (atomic_load(&cp->p.state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
     }
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP(SKIP_COMPUTE_PROG); return; }
-    {   // EOWRECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
-        static uint64_t skip = ~0ull;
-        if (skip == ~0ull) { const char *e = getenv("EOWRECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
-        if (skip && st.program->stages[5].code_addr == skip) { SKIP(SKIP_LIST); return; }
+    {   // EOWRECOMP_SKIP_CS=<code address hex>[,...] (debug): skip those compute shaders' dispatches, to see what they do
+        static uint64_t skip[8];
+        static int nskip = -1;
+        if (nskip < 0) {
+            nskip = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_CS"); p && *p && nskip < 8;) {
+                skip[nskip++] = strtoull(p, (char **)&p, 16);
+                while (*p == ',') p++;
+            }
+        }
+        for (int i = 0; i < nskip; i++) if (st.program->stages[5].code_addr == skip[i]) { SKIP(SKIP_LIST); return; }
     }
     if (g_debug_frame && getenv("EOWRECOMP_DEBUG_DATA")) {  // every dispatch of the captured frame: which buffers it can write
         // (2026-11-10: does any compute shader write the bone palette (vcb6 of the skinned draws)? match these ranges against it)
