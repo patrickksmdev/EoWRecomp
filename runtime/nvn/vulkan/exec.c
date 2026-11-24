@@ -2125,7 +2125,23 @@ static void resolve_feedback(Prog *pr) {
             for (int k = 0; k < nsnaps; k++) if (snaps[k].key == t && snaps[k].copy.image) existing = &snaps[k];
             VkImageAspectFlags sa = src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : src->aspect;
             static const VkComponentMapping id = {0};
-            if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && existing) {
+            // A snapshot is reused only while it still matches the texture: the game re-initializes texture objects in
+            // place (dynamic resolution: 896x504 .. 1067x600 here; and one object was an R11G11B10 colour target before
+            // it became a D24S8 depth-stencil), and the reused views are made with the texture's current format and
+            // aspect. Depth / stencil views of a colour snapshot made the void rift's draw (fs 72a46f5000, which samples
+            // its own depth-stencil's stencil) read memory the image hasn't: NVIDIA lost the device after Zelda's cloak
+            // (VK_ERROR_DEVICE_LOST, a page fault on a read; 8 of 16 runs, 0 of 16 with this - Windows, RTX 3070,
+            // 2026-11-24). Otherwise snapshot_image re-creates the copy for the texture as it is now.
+            bool fits = existing && existing->copy.width == src->width && existing->copy.height == src->height &&
+                        existing->copy.format == src->format && existing->copy.aspect == src->aspect;
+            if (existing && !fits) {
+                static int nlog;
+                if (nlog++ < 8)
+                    LOG("[vk] feedback snapshot of %p is stale (%ux%u fmt %d aspect %#x, texture now %ux%u fmt %d aspect %#x): copied again\n",
+                        (void *)t, existing->copy.width, existing->copy.height, existing->copy.format, existing->copy.aspect, src->width,
+                        src->height, src->format, src->aspect);
+            }
+            if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && fits) {
                 feedback_tex[nfeedback] = t;
                 feedback_view_s[nfeedback] = (src->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT) : VK_NULL_HANDLE;
                 feedback_view[nfeedback++] = vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
