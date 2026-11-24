@@ -2418,8 +2418,27 @@ static bool gmem_map_placed(uint64_t size) {
     return true;
 }
 
+// Imports replaced by a larger one. Not freed at once: the command buffer being recorded may already hold descriptors
+// naming the old buffer (waiting for the submitted work isn't enough), so each waits for the submission after it.
+#define GMEM_OLD 4
+static struct GmemOld { VkBuffer buf; VkDeviceMemory mem; uint64_t seq; } gmem_old[GMEM_OLD];
+static int gmem_nold;
+
+static void gmem_free_old(void) {
+    if (!gmem_nold) return;
+    uint64_t done = vk_completed_seq();
+    int k = 0;
+    for (int i = 0; i < gmem_nold; i++) {
+        if (gmem_old[i].seq > done) { gmem_old[k++] = gmem_old[i]; continue; }
+        vkDestroyBuffer(g_vk.dev, gmem_old[i].buf, NULL);
+        vkFreeMemory(g_vk.dev, gmem_old[i].mem, NULL);
+    }
+    gmem_nold = k;
+}
+
 static bool gmem_import(uint64_t size) {
     if (gmem_placed) return false;
+    gmem_free_old();
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
         (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetMemoryHostPointerPropertiesEXT");
     VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -2442,10 +2461,12 @@ static bool gmem_import(uint64_t size) {
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
-    if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
-        vk_wait_seq(submit_seq);
-        vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
-        vkFreeMemory(g_vk.dev, gmem_mem, NULL);
+    if (gmem_buf) {  // the heap grew: the old import is freed once the work that may use it has completed
+        if (gmem_nold == GMEM_OLD) {  // (several regrowths in flight: wait for the oldest)
+            vk_wait_seq(gmem_old[0].seq);
+            gmem_free_old();
+        }
+        gmem_old[gmem_nold++] = (struct GmemOld){gmem_buf, gmem_mem, vk_pending_seq()};
     }
     gmem_buf = buf;
     gmem_mem = mem;
@@ -2462,6 +2483,7 @@ void backend_set_heap_size(uint64_t size) {
 }
 
 static VkDescriptorBufferInfo gmem_info(void) {
+    gmem_free_old();
     static int off = -1;
     if (off < 0) off = getenv("EOWRECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
@@ -2817,6 +2839,8 @@ void vk_exec_reset(void) {
     gw_n = 0;
     gw_min_lo = gw_max_hi = gw_done_seq = 0;
     gcopy_gen++;
+    for (int i = 0; i < gmem_nold; i++) vkDestroyBuffer(g_vk.dev, gmem_old[i].buf, NULL), vkFreeMemory(g_vk.dev, gmem_old[i].mem, NULL);
+    gmem_nold = 0;
     if (gmem_buf) {
         if (gmem_placed) { vkUnmapMemory(g_vk.dev, gmem_mem); gmem_placed = false; }
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
