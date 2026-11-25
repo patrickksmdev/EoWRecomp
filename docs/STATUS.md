@@ -64,6 +64,23 @@ RX 580). Build cruzado no WSL (`tools/windows/build.sh`, zig cc), janela 1280x72
 - Outra causa, sem shader: o cache de pipelines era gravado no disco a cada 30 s na thread de render, entre dois
   quadros: 120-140 ms com o cache de ~100 MB. Agora grava numa thread separada (`23da42b`): essas travadas sumiram.
 
+### Modo de compilação de shaders (Sync / Smart / Async) - medido, 2026-11-24
+- O usuário achou o jogo pior que o fork Windows antigo depois de instalar o pacote (cache vazio): 49 de 146 janelas de
+  2 s com quadro > 100 ms, várias de 1-1,8 s. O fork antigo (~1000 compilações por sessão) tinha 3-5.
+- Causa: o padrão deste tree é `sync_shaders = sync` (espera cada shader novo); o fork antigo pulava o draw até o shader
+  ficar pronto (como Async). Em Sync, a tradução e a compilação rodam na thread de render, uma de cada vez.
+- Mesma rota (Ruínas de Suthorn), cache vazio: Sync 18-22 janelas > 100 ms, pior 1,2-2,2 s; Smart 14-17, ~1 s; Async
+  8-10, pior 0,18 s. Async mostra 1 quadro preto / um efeito faltando na primeira vez que um efeito grande aparece
+  (quadros a cada 4: 2108 todo preto, 5592/5596 manchas); Sync não. Com cache quente os três ficam parecidos.
+- O que o Smart espera (nova linha `[vk] render thread waited ... ms`, e `compile N (waited G+C ms)` nas estatísticas):
+  pipelines de tela cheia que o driver NVIDIA leva 100-580 ms para montar, sem nada na fila na frente. Tirar o job da fila
+  e montar na thread de render não mudou nada (pior 0,95-1,01 s contra 0,98 s): descartado.
+- Pré-compilação não fecha a lacuna: adicionar as 739 variantes vistas pelo usuário à lista distribuída deixou ~260
+  compilações em jogo, e 310 delas não são achadas no índice de shaders (o jogo monta/ajusta esses shaders em memória);
+  a lista do upstream também tem 251 assim. Revertido.
+- Decisão para o usuário: Async nas pastas de jogo (`run-patrick`, `pkg`), como o fork antigo ("Shader compilation" no
+  menu F1). Próximo passo possível: Smart com tempo máximo de espera (pular quando a montagem passa de ~1 quadro).
+
 ### Também neste tree
 - `gmem_import`: ao crescer o heap, a importação antiga era destruída depois de esperar só o trabalho já submetido,
   mas o command buffer em gravação pode já ter descritores dela; agora é liberada quando a submissão seguinte termina
