@@ -38,6 +38,7 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+static uint64_t stat_shwait_cs_ns, stat_shwait_gfx_ns;  // render thread time spent waiting for shaders being compiled (stats line)
 _Atomic unsigned vk_pipelines_made;  // (never reset: device.c saves the pipeline cache when it grew)
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
@@ -773,6 +774,21 @@ static void run_translate(void (*fn)(void *), void *arg) {
     pthread_mutex_unlock(&tjobs_lock);
 }
 
+// A build the render thread waits for (Sync / Smart modes, compute in both): a wait of 100 ms or more is logged with what it
+// was. On an empty cache, NVIDIA took 100-580 ms per full-screen pipeline here and Smart stalled up to ~1 s on them
+// (Windows / RTX 3070, 2026-11-24) - the build itself, nothing queued ahead of it.
+static void wait_built(_Atomic int *state, char kind, uint64_t code) {
+    uint64_t t0 = plat_now_ns();
+    while (atomic_load(state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
+    uint64_t ms = (plat_now_ns() - t0) / 1000000;
+    static int nlog;
+    if (ms >= 100 && nlog < 200) {
+        nlog++;
+        LOG("[vk] render thread waited %llu ms for a %s build (code %llx; %d builds queued)\n", (unsigned long long)ms,
+            kind == 'k' ? "compute" : kind == 'c' ? "program" : "pipeline", (unsigned long long)code, atomic_load(&g_jq_len));
+    }
+}
+
 static void run_job(void (*fn)(void *), void *arg) {
     if (sync_shaders()) {
         Uint64 t0 = SDL_GetTicks();
@@ -873,11 +889,13 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu, upload %.1fMB",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d (waited %.0f+%.0fms), fbcopy %llu, upload %.1fMB",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
-             atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
+             atomic_exchange(&stat_compiles, 0), (double)stat_shwait_gfx_ns / 1e6, (double)stat_shwait_cs_ns / 1e6,
+             (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
     stat_feedback_copies = stat_upload_bytes = 0;
+    stat_shwait_gfx_ns = stat_shwait_cs_ns = 0;
     if (stat_skipped) {
         size_t n = strlen(stats_text);
         n += snprintf(stats_text + n, sizeof stats_text - n, " | skipped:");
@@ -3159,7 +3177,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
     if (cp && atomic_load(&cp->p.state) == 0 && shader_mode() != SHADER_ASYNC) {
-        while (atomic_load(&cp->p.state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
+        uint64_t t0 = plat_now_ns();
+        wait_built(&cp->p.state, 'k', cp->p.code[0]);
+        stat_shwait_cs_ns += plat_now_ns() - t0;
     }
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP(SKIP_COMPUTE_PROG); return; }
     {   // EOWRECOMP_SKIP_CS=<code address hex>[,...] (debug): skip those compute shaders' dispatches, to see what they do
@@ -3315,7 +3335,9 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
     bool critical = !ind_buf && r->x[2] <= 6;
     int sm = shader_mode();
     if (pr && atomic_load(&pr->state) == 0 && (sm == SHADER_SYNC || (sm == SHADER_SMART && critical))) {
-        while (atomic_load(&pr->state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
+        uint64_t t0 = plat_now_ns();
+        wait_built(&pr->state, 'c', pr->code[1]);
+        stat_shwait_gfx_ns += plat_now_ns() - t0;
     }
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return true; }
     if (ind_buf != VK_NULL_HANDLE) {
@@ -3567,7 +3589,9 @@ static bool draw_(CmdRec *r, bool indexed, VkBuffer ind_buf, VkDeviceSize ind_of
         run_job(build_pipeline, pp);
     }
     if (atomic_load(&pp->state) == 0 && (sm == SHADER_SYNC || (sm == SHADER_SMART && critical))) {
-        while (atomic_load(&pp->state) == 0) plat_sleep_until_ns(plat_now_ns() + 250000);
+        uint64_t t0 = plat_now_ns();
+        wait_built(&pp->state, 'p', pp->k.prog ? pp->k.prog->code[1] : 0);
+        stat_shwait_gfx_ns += plat_now_ns() - t0;
     }
     if (atomic_load(&pp->state) != 1) { SKIP(atomic_load(&pp->state) == 0 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED); return true; }
     ss_enabled();
