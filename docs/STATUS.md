@@ -49,6 +49,21 @@ RX 580). Build cruzado no WSL (`tools/windows/build.sh`, zig cc), janela 1280x72
   de culling 72a4711000/15000 pareceu resolver (0/16), mas eles nem eram despachados nessa rota: foi sorte; atenção a isso
   ao bisectar com `EOWRECOMP_SKIP_CS` (conferir "skip list" no log).
 
+### Engasgos quando aparecem gráficos novos (relato do usuário, 2026-11-24)
+- O usuário jogou o build `run-patrick` com os próprios saves: rodou e ficou bonito, mas às vezes caíam alguns quadros
+  quando algo novo aparecia na tela.
+- Causa principal: compilação de shaders/pipelines na primeira vez que aparecem (modo `sync_shaders = sync`, o
+  padrão deste tree, espera a compilação). Com cache vazio, travadas de 0,5-4,5 s; com o cache do usuário (111 MB),
+  no máximo ~170 ms, e só onde surgem pipelines novos (cena da capa).
+- A preparação de shaders da tela inicial nunca rodava: o `play.bat` usa `EOWRECOMP_NO_LAUNCHER=1`, e
+  `EOWRECOMP_SHADER_PREP=1` não fazia nada (`shader_prep_boot` não era chamado). Agora é chamado (`dc47ac9`) e o
+  `play.bat` liga a opção (6 s com cache quente, 71 s com cache vazio). Ganho medido: cache vazio, compilações em jogo
+  775 -> 634 e pior travada 4,5 s -> 1,6 s; cache quente, pouca diferença. Limite: das 246 combinações de shader que
+  a rota usa, só 38 estão na lista distribuída (`shader_variants.txt`), e 251 entradas da lista não existem nos
+  arquivos deste jogo; a lista própria do jogador (`cache/shader_seen.txt`) cobre o resto depois da primeira vez.
+- Outra causa, sem shader: o cache de pipelines era gravado no disco a cada 30 s na thread de render, entre dois
+  quadros: 120-140 ms com o cache de ~100 MB. Agora grava numa thread separada (`23da42b`): essas travadas sumiram.
+
 ### Também neste tree
 - `gmem_import`: ao crescer o heap, a importação antiga era destruída depois de esperar só o trabalho já submetido,
   mas o command buffer em gravação pode já ter descritores dela; agora é liberada quando a submissão seguinte termina
