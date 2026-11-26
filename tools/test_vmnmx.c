@@ -19,8 +19,8 @@ int main(void) {
     ShaderInfo *info = maxwell_translate(blob, 0x400, STAGE_VERTEX, &key);
     if (!info->msl) { printf("FAIL: translate failed: %s\n", info->error); return 1; }
     const char *m = info->msl;
-    int ok = strstr(m, "r15 = uint(max(int(max(int(r42), int(r17))), int(r15)));");
-    ok = ok && strstr(m, "r16 = uint(max(int(max(int(r30), int(r16))), int(r31)));");
+    int ok = strstr(m, "r15 = uint(max(int(max(int(r42), int(r17))), int(r15)));") != NULL;
+    ok = ok && strstr(m, "r16 = uint(max(int(max(int(r30), int(r16))), int(r31)));") != NULL;
     printf("%s: VMNMX three-way max\n", ok ? "PASS" : "FAIL");
     if (!ok) fputs(m, stdout);
     return !ok;

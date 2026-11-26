@@ -223,6 +223,12 @@ int main(int argc, char **argv) {
         extern void ui_window_init(void);
         ui_window_init();
 #endif
+        if (!title) {  // straight into the game: EOWRECOMP_SHADER_PREP=1 prepares the shaders as the start screen does
+            extern void shader_prep_boot(const char *romfs);
+            char romfs[1100];
+            snprintf(romfs, sizeof romfs, "%s/romfs", root);
+            shader_prep_boot(romfs);
+        }
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();

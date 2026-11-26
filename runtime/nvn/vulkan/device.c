@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -170,6 +171,9 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
+    // EOWRECOMP_VK_CHECKPOINTS=1 (NVIDIA): markers in the command buffers, read back on device loss (exec.c dl_*)
+    g_vk.checkpoints = getenv("EOWRECOMP_VK_CHECKPOINTS") && has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    if (g_vk.checkpoints) ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
 
     // features the backend relies on (all present on current desktop drivers)
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT have_placed = {
@@ -278,12 +282,46 @@ static void create_device(void) {
     free(data);
 }
 
+// One save at a time (the exit / background-app saves wait for a periodic one still writing: same temporary file).
+static pthread_mutex_t pcache_save_lock = PTHREAD_MUTEX_INITIALIZER;
+static void pipeline_cache_save_locked(void);
 void vk_pipeline_cache_save(void) {
+    pthread_mutex_lock(&pcache_save_lock);
+    pipeline_cache_save_locked();
+    pthread_mutex_unlock(&pcache_save_lock);
+}
+
+// The periodic save runs on its own thread: the cache grows to ~100 MB in a long session (Windows / RTX 3070,
+// 2026-11-24), and getting and writing that took the frame it happened in to 120-140 ms every 30 s while new
+// pipelines appeared. (vkGetPipelineCacheData doesn't need the cache externally synchronized: pipelines keep being
+// created into it meanwhile.)
+static atomic_bool pcache_saving;
+static void *pipeline_cache_save_thread(void *arg) {
+    (void)arg;
+    vk_pipeline_cache_save();
+    atomic_store(&pcache_saving, false);
+    return NULL;
+}
+static void pipeline_cache_save_async(void) {
+    if (atomic_exchange(&pcache_saving, true)) return;  // (the one still writing has most of it)
+    pthread_t th;
+    if (pthread_create(&th, NULL, pipeline_cache_save_thread, NULL) == 0) pthread_detach(th);
+    else atomic_store(&pcache_saving, false);
+}
+
+static void pipeline_cache_save_locked(void) {
     if (getenv("EOWRECOMP_NO_PIPELINE_CACHE")) return;
     size_t sz = 0;
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
-    void *data = malloc(sz);
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
+    void *data = NULL;
+    VkResult r = VK_INCOMPLETE;
+    for (int tries = 0; r == VK_INCOMPLETE && tries < 4; tries++) {  // (grown since the size query: pipelines being made)
+        free(data), data = NULL;
+        if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
+        sz += sz / 16;
+        data = malloc(sz);
+        r = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data);
+    }
+    if (r == VK_SUCCESS) {
         mkdir("cache", 0755);
         FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
         if (f) {
@@ -637,7 +675,7 @@ void backend_present(NvnTexture *t) {
         static uint64_t at;
         uint64_t now = SDL_GetTicksNS();
         unsigned m = atomic_load(&vk_pipelines_made);
-        if (m != saved && now - at > 30000000000ull) saved = m, at = now, vk_pipeline_cache_save();
+        if (m != saved && now - at > 30000000000ull) saved = m, at = now, pipeline_cache_save_async();
     }
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
