@@ -4,6 +4,7 @@
 
 #include "../hle.h"
 #include "../ipc.h"
+#include "../paths.h"
 #include "../settings.h"
 
 #define AM_NO_MESSAGE MAKE_RESULT(128, 3)
@@ -158,9 +159,26 @@ static void application_functions(Service *s, IpcReq *req, IpcResp *resp) {
         resp_size(resp, 8);
         break;
     }
-    case 23: memcpy(resp->data, "1.0.0", 6); resp_size(resp, 0x10); break;
+    case 23: {  // GetDisplayVersion: the version that's running (1.0.0, or 1.1.0 with the update)
+        const char *v = rt_game_version(g_main_build_id);
+        memset(resp->data, 0, 0x10);
+        snprintf((char *)resp->data, 0x10, "%s", v ? v : "1.0.0");
+        resp_size(resp, 0x10);
+        break;
+    }
     case 40: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // NotifyRunning
     case 130: case 140: resp->copy_handles[resp->ncopy++] = new_event(); break;
+    case 210: {  // (newer SDKs, Echoes of Wisdom 1.1.0's) the event nn::oe::GetOperationMode waits for before asking
+        // ICommonStateGetter again (its cached mode is stale): signaled from the start, so the first call asks. Without
+        // it the game polled handle 0 forever at boot
+        uint32_t w, r;
+        KEvent *e = kernel_create_event_pair(&w, &r);
+        pthread_mutex_lock(&g_klock);
+        kernel_signal(e);
+        pthread_mutex_unlock(&g_klock);
+        resp->copy_handles[resp->ncopy++] = r;
+        break;
+    }
     default: UNHANDLED("IApplicationFunctions");
     }
 }
